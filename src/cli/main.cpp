@@ -88,7 +88,7 @@ namespace {
             "host buffers, allocated before the runs (--context --pinned is how libcubwt measures).\n"
             "ratio builds the BWT on the GPU, encodes and decodes it with the CPU reference codec,\n"
             "checks the round trip and prints the compressed sizes. --segment (default 15): frequency\n"
-            "tables per 2^LOG2 bytes; --slice (default 15, 10 to 17): one 32-lane stream per 2^LOG2\n"
+            "tables per 2^LOG2 bytes; --slice (default 15, 10 to 16): one 32-lane stream per 2^LOG2\n"
             "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use.\n");
     }
 

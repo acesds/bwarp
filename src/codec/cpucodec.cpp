@@ -445,10 +445,11 @@ namespace {
         }
 
         // Tokens whose own symbol, or whose predecessor's, falls into context c.
-        uint64_t contextTokens[kMaxContexts] = {};
+        uint64_t contextTokens[kMaxContexts] = {}, lengthContextTokens[kMaxContexts] = {};
 
         for (uint32_t r = 0; r < model.alphabet; r++) {
             contextTokens[contextOf(r, k)] += rankCount[r];
+            lengthContextTokens[contextOf(r, lengthContexts(k))] += rankCount[r];
         }
 
         RowModels* const rows = models.rows;
@@ -463,9 +464,9 @@ namespace {
             }
         }
 
-        for (uint32_t c = 0; c < k; c++) {
+        for (uint32_t c = 0; c < lengthContexts(k); c++) {
             if (!codeRow(coder, rows[1], model.lengthUsed[c], model.lengthQ[c], model.lengthCount[c], model.lengthCodes,
-                    kMaxLengthCodes, lengthCount, contextTokens[c], lengthTokens, model.mantissa, maxQ)) {
+                    kMaxLengthCodes, lengthCount, lengthContextTokens[c], lengthTokens, model.mantissa, maxQ)) {
                 return false;
             }
         }
@@ -502,7 +503,7 @@ namespace {
             const uint32_t code = lengthCode(run.length).code;
 
             symbolCounts[context * 256 + rank]++;
-            lengthCounts[contextOf(rank, contexts) * kMaxLengthCodes + code]++;
+            lengthCounts[contextOf(rank, lengthContexts(contexts)) * kMaxLengthCodes + code]++;
             lengthTotal[code]++;
             previous = rank;
         }
@@ -555,7 +556,7 @@ namespace {
             const uint32_t context = run.laneStart ? k - 1 : contextOf(previous, k);
 
             bits += cost[model.symbolFreq[context][rank]];
-            bits += cost[model.lengthFreq[contextOf(rank, k)][lengthCode(run.length).code]];
+            bits += cost[model.lengthFreq[contextOf(rank, lengthContexts(k))][lengthCode(run.length).code]];
             previous = rank;
         }
 
@@ -663,7 +664,7 @@ namespace {
                         freq = model.symbolFreq[token.context][token.rank];
                         cum = model.symbolCum[token.context][token.rank];
                     } else if (op == 1) {
-                        const uint32_t c = contextOf(token.rank, model.contexts);
+                        const uint32_t c = contextOf(token.rank, lengthContexts(model.contexts));
                         freq = model.lengthFreq[c][length.code];
                         cum = model.lengthCum[c][length.code];
                     } else {
@@ -783,7 +784,7 @@ namespace {
                     continue;
                 }
 
-                const uint32_t c = contextOf(rank[j], model.contexts);
+                const uint32_t c = contextOf(rank[j], lengthContexts(model.contexts));
 
                 if (!model.lengthUsed[c]) {
                     return false;

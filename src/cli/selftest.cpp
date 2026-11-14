@@ -212,7 +212,7 @@ namespace {
     }
 
     void runCodecCases(Suite& suite) {
-        const EncodeParams paramSets[] = {{15, 15, 16}, {20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {17, 17, 16}, {24, 12, 2}};
+        const EncodeParams paramSets[] = {{15, 15, 16}, {20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {16, 16, 16}, {24, 12, 2}};
         Rng rng{5};
         std::vector<std::pair<std::string, std::vector<uint8_t>>> inputs = {
             {"\"\"", {}},

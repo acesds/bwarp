@@ -27,11 +27,11 @@ namespace bwarp {
 
     constexpr int kLanes = 32;
     constexpr int kMinLogSlice = 10;
-    constexpr int kMaxLogSlice = 17;  // at most 4096 bytes per lane, so a run's extra bits fit one rANS op
+    constexpr int kMaxLogSlice = 16;  // at most 2048 bytes per lane, so a run's extra bits fit one rANS op
     constexpr int kMaxLogSegment = 24;
     constexpr int kMaxContexts = 16;
 
-    constexpr int kProbBits = 12;
+    constexpr int kProbBits = 11;  // 2 KiB decoding tables per context
     constexpr uint32_t kProbScale = 1u << kProbBits;
     constexpr uint32_t kRansLow = 1u << 16;  // states stay in [kRansLow, 2^32); I/O in 16-bit words
 
@@ -90,6 +90,13 @@ namespace bwarp {
     // is the bucket of its own symbol.
     BWARP_HD uint32_t contextOf(uint32_t rank, uint32_t contexts) {
         return rank < contexts - 1 ? rank : contexts - 1;
+    }
+
+    // Run lengths use only the first contexts.
+    constexpr uint32_t kMaxLengthContexts = 4;
+
+    BWARP_HD uint32_t lengthContexts(uint32_t contexts) {
+        return contexts < kMaxLengthContexts ? contexts : kMaxLengthContexts;
     }
 
     // Before encoding with freq, x must be below this, or a 16-bit word goes out first.
