@@ -650,6 +650,8 @@ namespace bwarp::gpu {
         }
     }
 
+    constexpr uint32_t kReservedOps = 4096;  // per table, in the memory the host reserves for them: typically enough
+
     // Records a table's decisions as rANS ops, freq | cum << 16, the way TableWriter does.
     struct OpRecorder {
         uint32_t* ops;
@@ -713,22 +715,49 @@ namespace bwarp::gpu {
             codeRows(recorder, table, models, [&](bool symbol, uint32_t c, uint32_t i) {
                 return lookupPredicted(predictedQ[warp], symbol, c, i);
             });
+        }
 
-            const uint32_t* const op = ops + opOffsets[g];
-            uint16_t* const end = words + opOffsets[g + 1];
-            uint32_t x = kRansLow, count = 0;
+        __syncwarp();
 
-            for (uint32_t i = recorder.count; i-- > 0;) {
-                const uint32_t freq = op[i] & 0xffff, cum = op[i] >> 16;
+        // The warp encodes the ops backwards, every lane alike: each batch of 32 is loaded a batch ahead and handed
+        // around by shuffles, and lane 0 stores the words. Each lane divides by its op's freq ahead, as a
+        // multiplication by ceil(2^64 / freq): exact, the state being below 2^32 and freq at most 2^11.
+        const uint32_t total = __shfl_sync(~0u, recorder.count, 0);
+        const uint32_t* const op = ops + opOffsets[g];
+        uint16_t* const end = words + opOffsets[g + 1];
+        uint32_t x = kRansLow, count = 0;
+        uint32_t next = lane < total ? op[total - 1 - lane] : 1;
 
-                if (ransNeedsOutput(x, freq)) {
-                    end[-1 - int64_t(count++)] = static_cast<uint16_t>(x);
+        for (uint32_t done = 0; done < total; done += 32) {
+            const uint32_t e = next, steps = min(32u, total - done);
+            const uint32_t freq = e & 0xffff;
+            const uint32_t limit = static_cast<uint32_t>(min((uint64_t(freq) << 21) - 1, uint64_t(~0u)));
+            const uint64_t inverse = freq > 1 ? ~uint64_t(0) / freq + 1 : 0;
+
+            next = done + 32 + lane < total ? op[total - 33 - done - lane] : 1;
+
+            for (uint32_t t = 0; t < steps; t++) {
+                const uint32_t f = __shfl_sync(~0u, e, t);
+                const uint32_t outLimit = __shfl_sync(~0u, limit, t);
+                const uint64_t m = __shfl_sync(~0u, inverse, t);
+
+                if (x > outLimit) {  // ransNeedsOutput()
+                    if (lane == 0) {
+                        end[-1 - int64_t(count)] = static_cast<uint16_t>(x);
+                    }
+
+                    count++;
                     x >>= 16;
                 }
 
-                x = ransEncode(x, freq, cum);
+                // ransEncode()
+                const uint32_t opFreq = f & 0xffff;
+                const uint32_t q = opFreq > 1 ? static_cast<uint32_t>(__umul64hi(x, m)) : x;
+                x = (q << kProbBits) + (x - q * opFreq) + (f >> 16);
             }
+        }
 
+        if (lane == 0) {
             wordCounts[g] = count;
             states[g] = x;
         }
@@ -757,14 +786,25 @@ namespace bwarp::gpu {
 
     constexpr uint32_t kEncodeWarps = 4;  // slices per block of the stream encoder
 
+    // Where encodeSlices() puts the streams. Into scratch, slice s's words end at (s + 1) * capacity and those beyond
+    // capacity are dropped, its final states go to states[32 s + lane], and words[s] counts all its words; the
+    // tokens add up in tokens. Into out, given words[s], the stream goes to offsets[s].
+    struct SliceOutput {
+        uint32_t* words;
+        uint16_t* scratch;
+        uint32_t capacity;
+        uint32_t* states;
+        unsigned long long* tokens;
+        const uint64_t* offsets;
+        uint8_t* out;
+    };
+
     // A warp per slice, as encodeSlice(): lanes walk their runs backwards over the decoder's (step, op, lane) order;
-    // the words a step's lanes push go out in descending lane order. Without kWrite, counts each slice's words in
-    // words[s] and the tokens; with it, writes the stream at offsets[s], given words[s].
+    // the words a step's lanes push go out in descending lane order. Into out with kWrite, else into scratch.
     template <bool kWrite>
     __global__ void __launch_bounds__(kEncodeWarps * 32) encodeSlices(const uint8_t* __restrict__ bwt, uint32_t n,
         uint32_t slices, int logSegment, int logSlice, const TableData* __restrict__ tables,
-        const DeviceTable* __restrict__ codes, uint32_t* words, const uint64_t* offsets, uint8_t* out,
-        unsigned long long* tokens) {
+        const DeviceTable* __restrict__ codes, SliceOutput to) {
         const uint32_t sl = blockIdx.x * kEncodeWarps + threadIdx.x / 32, j = threadIdx.x & 31;
 
         if (sl >= slices) {
@@ -786,8 +826,9 @@ namespace bwarp::gpu {
         }
 
         const uint32_t steps = __reduce_max_sync(~0u, count);
-        uint8_t* const stream = kWrite ? out + offsets[sl] : nullptr;
-        const uint32_t total = kWrite ? words[sl] : 0;
+        uint8_t* const stream = kWrite ? to.out + to.offsets[sl] : nullptr;
+        const uint32_t total = kWrite ? to.words[sl] : 0;
+        uint16_t* const scratchEnd = kWrite ? nullptr : to.scratch + size_t(sl + 1) * to.capacity;
         uint32_t x = kRansLow, pos = laneEnd, pushed = 0;
 
         for (uint32_t t = steps; t-- > 0;) {
@@ -830,9 +871,12 @@ namespace bwarp::gpu {
                 const uint32_t mask = __ballot_sync(~0u, out16);
 
                 if (out16) {
+                    const uint32_t index = pushed + __popc(j == 31 ? 0 : mask >> (j + 1));
+
                     if constexpr (kWrite) {
-                        const uint32_t index = pushed + __popc(j == 31 ? 0 : mask >> (j + 1));
                         put16(stream + kLanes * 4 + 2 * size_t(total - 1 - index), x);
+                    } else if (index < to.capacity) {
+                        scratchEnd[-1 - int64_t(index)] = static_cast<uint16_t>(x);
                     }
 
                     x >>= 16;
@@ -852,10 +896,29 @@ namespace bwarp::gpu {
         } else {
             const uint32_t sum = __reduce_add_sync(~0u, count);
 
+            to.states[sl * kLanes + j] = x;
+
             if (j == 0) {
-                words[sl] = pushed;
-                atomicAdd(tokens, static_cast<unsigned long long>(sum));
+                to.words[sl] = pushed;
+                atomicAdd(to.tokens, static_cast<unsigned long long>(sum));
             }
+        }
+    }
+
+    // A block per slice: moves a stream encodeSlices() put into scratch whole to offsets[s].
+    __global__ void placeSlices(SliceOutput to) {
+        const uint32_t sl = blockIdx.x, total = to.words[sl];
+        uint8_t* const stream = to.out + to.offsets[sl];
+        const uint16_t* const from = to.scratch + size_t(sl + 1) * to.capacity - total;
+
+        if (threadIdx.x < kLanes) {
+            const uint32_t x = to.states[sl * kLanes + threadIdx.x];
+            put16(stream + 4 * threadIdx.x, x);
+            put16(stream + 4 * threadIdx.x + 2, x >> 16);
+        }
+
+        for (uint32_t i = threadIdx.x; i < total; i += blockDim.x) {
+            put16(stream + kLanes * 4 + 2 * i, from[i]);
         }
     }
 }

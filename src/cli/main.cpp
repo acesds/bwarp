@@ -726,17 +726,17 @@ namespace {
 
                 ok = gpuEncoded == encoded;
 
-                const double device = stats.chooseSeconds + stats.tableSeconds + stats.sizeSeconds + stats.streamSeconds;
+                const double device = stats.chooseSeconds + stats.tableSeconds + stats.streamSeconds + stats.placeSeconds;
 
                 if (r == 0 || device < run.gpuEncodeSeconds) {
                     run.gpuEncodeSeconds = device;
                 }
 
                 if (options.verbose && r == 1) {
-                    printf("  GPU encoder: upload %.2f ms, choosing %.2f ms, tables %.2f ms, sizing %.2f ms, streams "
+                    printf("  GPU encoder: upload %.2f ms, choosing %.2f ms, tables %.2f ms, streams %.2f ms, placing "
                            "%.2f ms, download %.2f ms, %lld MiB\n",
                         1e3 * stats.uploadSeconds, 1e3 * stats.chooseSeconds, 1e3 * stats.tableSeconds,
-                        1e3 * stats.sizeSeconds, 1e3 * stats.streamSeconds, 1e3 * stats.downloadSeconds,
+                        1e3 * stats.streamSeconds, 1e3 * stats.placeSeconds, 1e3 * stats.downloadSeconds,
                         static_cast<long long>(stats.deviceBytes >> 20));
                 }
             }

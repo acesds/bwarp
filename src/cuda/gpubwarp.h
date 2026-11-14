@@ -114,8 +114,8 @@ struct GpuEncodeStats {
     double uploadSeconds = 0.0;
     double chooseSeconds = 0.0;    // choosing the tables
     double tableSeconds = 0.0;     // coding them
-    double sizeSeconds = 0.0;      // sizing the streams
-    double streamSeconds = 0.0;    // placing the tables and encoding the streams
+    double streamSeconds = 0.0;    // encoding the streams
+    double placeSeconds = 0.0;     // placing the tables and streams
     double downloadSeconds = 0.0;
 };
 
