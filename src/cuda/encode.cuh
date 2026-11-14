@@ -25,13 +25,14 @@ namespace bwarp::gpu {
         return (p - sliceBegin) % laneBytes(min(n - sliceBegin, 1u << logSlice)) == 0;
     }
 
-    // For each run of slices [first, end), calls start(byte, laneStart, previous byte) at its first byte and
-    // finish(byte, length) at its last, in no particular order. The block's threads take 16 bytes each; a run's
-    // end finds its start in the chunk or, through a block-wide max-scan, in an earlier one. bwt is padded to
-    // 16 bytes.
-    template <class Start, class Finish>
+    // For each run of slices [first, end), calls start(its rank, laneStart, the previous byte's rank) at its first
+    // byte and finish(its rank, length) at its last, in no particular order, a byte's rank being rank(byte). The
+    // block's threads take 16 bytes each and rank them all before calling, so that the calls' atomics wait on no
+    // loads. A run's end finds its start in the chunk or, through a block-wide max-scan, in an earlier one. bwt is
+    // padded to 16 bytes.
+    template <class Rank, class Start, class Finish>
     __device__ void forEachRun(const uint8_t* __restrict__ bwt, uint32_t n, int logSlice, uint32_t first, uint32_t end,
-        Start start, Finish finish) {
+        Rank rank, Start start, Finish finish) {
         using BlockScan = cub::BlockScan<uint32_t, kChooseThreads>;
         __shared__ typename BlockScan::TempStorage scan;
 
@@ -40,14 +41,15 @@ namespace bwarp::gpu {
 
         for (uint32_t base = first << logSlice; base < stop; base += kChooseThreads * 16) {
             const uint32_t at = base + threadIdx.x * 16;
-            uint32_t starts = 0, laneStarts = 0, ends = 0, words[4] = {};
+            uint32_t starts = 0, laneStarts = 0, ends = 0, words[4] = {}, before = 0;
 
             if (at < stop) {
                 const uint4 chunk = *reinterpret_cast<const uint4*>(bwt + at);
                 const uint32_t sliceBegin = at >> logSlice << logSlice;  // a chunk never crosses a slice
                 const uint32_t lb = laneBytes(min(n - sliceBegin, 1u << logSlice));
                 const uint32_t into = (at - sliceBegin) % lb;
-                uint32_t previous = at > 0 ? uint32_t(__ldg(bwt + at - 1)) << 24 : 0;  // in the top byte
+                before = at > 0 ? __ldg(bwt + at - 1) : 0;
+                uint32_t previous = before << 24;  // in the top byte
 
                 words[0] = chunk.x;
                 words[1] = chunk.y;
@@ -81,6 +83,14 @@ namespace bwarp::gpu {
                 }
             }
 
+            uint32_t ranks[16];
+            const uint32_t beforeRank = rank(before);
+
+#pragma unroll
+            for (uint32_t k = 0; k < 16; k++) {
+                ranks[k] = rank((words[k / 4] >> (8 * (k % 4))) & 255);
+            }
+
             const uint32_t last = starts ? at + 31 - __clz(starts) + 1 : 0;
             uint32_t open, aggregate;
 
@@ -89,23 +99,21 @@ namespace bwarp::gpu {
             carry = max(carry, aggregate);
             __syncthreads();
 
-            for (uint32_t bits = starts; bits != 0; bits &= bits - 1) {
-                const uint32_t k = __ffs(bits) - 1;
-                const uint32_t byte = (words[k / 4] >> (8 * (k % 4))) & 255;
-                const bool laneStart = (laneStarts >> k) & 1;
-                const uint32_t previous = laneStart ? 0
-                                          : k > 0   ? (words[(k - 1) / 4] >> (8 * ((k - 1) % 4))) & 255
-                                                    : __ldg(bwt + at - 1);
-
-                start(static_cast<uint8_t>(byte), laneStart, static_cast<uint8_t>(previous));
+#pragma unroll
+            for (uint32_t k = 0; k < 16; k++) {
+                if ((starts >> k) & 1) {
+                    start(ranks[k], (laneStarts >> k) & 1, k > 0 ? ranks[k - 1] : beforeRank);
+                }
             }
 
-            for (uint32_t bits = ends; bits != 0; bits &= bits - 1) {
-                const uint32_t k = __ffs(bits) - 1;
-                const uint32_t before = starts & ((2u << k) - 1);
-                const uint32_t runStart = before ? at + 31 - __clz(before) : open - 1;
+#pragma unroll
+            for (uint32_t k = 0; k < 16; k++) {
+                if ((ends >> k) & 1) {
+                    const uint32_t prior = starts & ((2u << k) - 1);
+                    const uint32_t runStart = prior ? at + 31 - __clz(prior) : open - 1;
 
-                finish(static_cast<uint8_t>((words[k / 4] >> (8 * (k % 4))) & 255), at + k + 1 - runStart);
+                    finish(ranks[k], at + k + 1 - runStart);
+                }
             }
         }
     }
@@ -120,51 +128,137 @@ namespace bwarp::gpu {
         uint32_t decisions;
     };
 
-    // codeRow()'s models are independent chains: part 0 is the used and nonzero flags, part 1 + r the residuals in
-    // residual context r. Their costs add up.
-    constexpr uint32_t kRowParts = 1 + kResidualContexts;
+    // codeRow()'s models are independent chains, coded in parts whose costs add up: part 0 is the nonzero flag in
+    // zero context 0 (40% of the entries in text), part 1 the used flag and the other nonzero flags, part 2 + r the
+    // residuals in residual context r.
+    constexpr uint32_t kZeroParts = 2;
+    constexpr uint32_t kRowParts = kZeroParts + kResidualContexts;
 
-    // codeRow()'s cost in one part.
-    __device__ void costRowPart(CostCoder& coder, RowModels& models, bool used, const uint16_t* q,
-        const uint8_t* predicted, uint32_t size, uint32_t skip, uint32_t part) {
-        if (part == 0) {
-            coder.bit(models.used, used);
+    // A part's probabilities, held by a warp a lane each: in parts 0 and 1, lane z has nonzero[z] and lane 0 of part
+    // 1 also used; in part 2 + r, lane k < 16 has residual[r].length[k] and lane 16 + k residual[r].top[k]. Each sees
+    // the bits codeRow() codes with it in the same order, so the integer costs add up to the same sums. bits and
+    // decisions are the lane's share.
+    static_assert(kZeroContexts == 32 && 2 * kMaxUintBits == 32);
+
+    struct LaneCells {
+        uint32_t p = kProbScale / 2;
+        uint32_t used = kProbScale / 2;  // part 1, lane 0; costMarginal(): nonzero[lane], lanes 0 and 1
+        uint32_t bits = 0;
+        uint32_t decisions = 0;
+
+        // Codes b with prob in the active lanes, without branching: the warp's steps form one chain whichever lanes
+        // are active, so each is kept short. Idle lanes read cost[0], so that a step loads at most two lines.
+        __device__ void code(const uint32_t* __restrict__ cost, uint32_t& prob, bool active, uint32_t b) {
+            const uint32_t c = __ldg(cost + (active ? (b ? kProbScale - prob : prob) : 0));
+
+            bits += active ? c : 0;
+            decisions += active;
+            prob = active ? adaptProbability(prob, b) : prob;
         }
+
+        // codeUint(v) on UintModels a lane each, as in part 2 + r: length[k] for k up to v + 1's bit length (below
+        // 15), top[that k], then raw bits (lane 0).
+        __device__ void codeUint(const uint32_t* __restrict__ cost, uint32_t v, uint32_t lane) {
+            const uint32_t u = v + 1, length = floorLog2(u);
+            const uint32_t k = min(length, kMaxUintBits - 1), cell = lane % kMaxUintBits;
+
+            const uint32_t raw = lane == 0 && k > 1 ? k - 1 : 0;
+
+            code(cost, p, lane < kMaxUintBits ? cell < kMaxUintBits - 1 && cell <= length : k >= 1 && cell == k,
+                lane < kMaxUintBits ? cell < length : (u >> (k > 0 ? k - 1 : 0)) & 1);
+            bits += raw * __ldg(cost + kProbScale / 2);
+            decisions += raw;
+        }
+
+        __device__ void load(const RowModels& models, uint32_t part, uint32_t lane) {
+            if (part < kZeroParts) {
+                p = models.nonzero[lane].p;
+                used = models.used.p;
+            } else {
+                const UintModels& values = models.residual[part - kZeroParts];
+                p = lane < kMaxUintBits ? values.length[lane].p : values.top[lane - kMaxUintBits].p;
+            }
+        }
+
+        __device__ void save(RowModels& models, uint32_t part, uint32_t lane) const {
+            if (part < kZeroParts) {
+                if ((lane == 0) == (part == 0)) {
+                    models.nonzero[lane].p = static_cast<uint16_t>(p);
+                }
+
+                if (part == 1 && lane == 0) {
+                    models.used.p = static_cast<uint16_t>(used);
+                }
+            } else {
+                UintModels& values = models.residual[part - kZeroParts];
+                (lane < kMaxUintBits ? values.length[lane] : values.top[lane - kMaxUintBits]).p = static_cast<uint16_t>(p);
+            }
+        }
+    };
+
+    // codeRow()'s cost in one part, by a warp.
+    __device__ void costRowPart(LaneCells& cells, const uint32_t* __restrict__ cost, bool used, const uint16_t* q,
+        const uint8_t* predicted, uint32_t size, uint32_t skip, uint32_t part, uint32_t lane) {
+        cells.code(cost, cells.used, part == 1 && lane == 0, used);
 
         if (!used) {
             return;
         }
 
-        for (uint32_t i = 0; i < size; i++) {
-            if (i == skip) {
-                continue;
-            }
+        // 32 entries at a time, lane j reading entry j, then the part's own in order: in parts 0 and 1, each to the
+        // lane of its zero context.
+        for (uint32_t at = 0; at < size; at += 32) {
+            const uint32_t i = at + lane;
+            const bool valid = i < size && i != skip;
+            const uint32_t pq = valid ? predicted[i] : 0, qi = valid ? q[i] : 0;
 
-            const uint32_t pq = predicted[i];
+            if (part < kZeroParts) {
+                const uint32_t zeroContext = min(pq, kZeroContexts - 1);
+                const bool match = valid && (zeroContext == 0) == (part == 0);
 
-            if (part == 0) {
-                coder.bit(models.nonzero[pq < kZeroContexts - 1 ? pq : kZeroContexts - 1], q[i] != 0);
-            } else if (q[i] != 0) {
-                const uint32_t residualContext = min(floorLog2(pq + 1), kResidualContexts - 1);
+                for (uint32_t matches = __ballot_sync(~0u, match); matches != 0; matches &= matches - 1) {
+                    const uint32_t from = __ffs(matches) - 1;
+                    cells.code(cost, cells.p, lane == __shfl_sync(~0u, zeroContext, from), __shfl_sync(~0u, qi, from) != 0);
+                }
+            } else {
+                const int32_t base = static_cast<int32_t>(pq > 1 ? pq : 1);
+                const uint32_t v = zigzag(int32_t(qi) - base);
+                const bool match =
+                    valid && qi != 0 && min(floorLog2(pq + 1), kResidualContexts - 1) == part - kZeroParts;
 
-                if (residualContext == part - 1) {
-                    const int32_t base = static_cast<int32_t>(pq > 1 ? pq : 1);
-                    codeUint(coder, models.residual[residualContext], zigzag(int32_t(q[i]) - base));
+                for (uint32_t matches = __ballot_sync(~0u, match); matches != 0; matches &= matches - 1) {
+                    cells.codeUint(cost, __shfl_sync(~0u, v, __ffs(matches) - 1), lane);
                 }
             }
         }
     }
 
-    // Copies one part's models.
-    __device__ void copyRowPart(RowModels& to, const RowModels& from, uint32_t part) {
-        if (part == 0) {
-            to.used = from.used;
+    // codeMarginal()'s cost, by a warp: lanes 0 and 1 hold nonzero[0] and [1], the lanes the value models.
+    __device__ void costMarginal(LaneCells& cells, const uint32_t* __restrict__ cost, const uint16_t* q, uint32_t size,
+        uint32_t lane) {
+        int32_t previous = 0;     // the last nonzero q so far
+        uint32_t previousZero = 1;
 
-            for (uint32_t i = 0; i < kZeroContexts; i++) {
-                to.nonzero[i] = from.nonzero[i];
+        // 32 entries at a time, lane j reading entry j and finding what comes before it in the earlier lanes.
+        for (uint32_t at = 0; at < size; at += 32) {
+            const uint32_t count = min(32u, size - at);
+            const uint32_t qi = lane < count ? q[at + lane] : 0;
+            const uint32_t nonzeros = __ballot_sync(~0u, qi != 0), before = nonzeros & ((1u << lane) - 1);
+            const uint32_t zeroBefore = lane == 0 ? previousZero : !((nonzeros >> (lane - 1)) & 1);
+            const int32_t base = static_cast<int32_t>(__shfl_sync(~0u, qi, before ? 31 - __clz(before) : 0));
+            const uint32_t v = zigzag(int32_t(qi) - (before ? base : previous));
+
+            // Each nonzero flag to lane 0 or 1, by the one before; then the values.
+            for (uint32_t j = 0; j < count; j++) {
+                cells.code(cost, cells.used, lane == __shfl_sync(~0u, zeroBefore, j), (nonzeros >> j) & 1);
             }
-        } else {
-            to.residual[part - 1] = from.residual[part - 1];
+
+            for (uint32_t matches = nonzeros; matches != 0; matches &= matches - 1) {
+                cells.codeUint(cost, __shfl_sync(~0u, v, __ffs(matches) - 1), lane);
+            }
+
+            previousZero = !((nonzeros >> (count - 1)) & 1);
+            previous = nonzeros ? static_cast<int32_t>(__shfl_sync(~0u, qi, 31 - __clz(nonzeros))) : previous;
         }
     }
 
@@ -208,7 +302,6 @@ namespace bwarp::gpu {
         uint32_t alphabet;
         uint32_t winner;  // log2 K of this m's best so far, or UINT32_MAX
         __align__(16) uint8_t table[sizeof(TableData)];  // with the shared rows
-        __align__(16) uint8_t models[sizeof(TableModels)];
         __align__(16) uint8_t snapshots[sizeof(RowModels) * (kContextChoices + kLengthChoices)];  // the models before
                                                                                                     // each last row
     };
@@ -218,27 +311,91 @@ namespace bwarp::gpu {
         return quantizeCount(hi[i] - lo[i], m);
     }
 
-    // The stream cost of a row of size entries with counts hi - lo, coded with the frequencies of q.
+    __device__ __forceinline__ uint64_t warpSum(uint64_t v) {
+        for (uint32_t d = 16; d > 0; d /= 2) {
+            v += __shfl_xor_sync(~0u, v, d);
+        }
+
+        return v;
+    }
+
+    // The stream cost of a row of size entries with counts hi - lo, coded with the frequencies of q, by a warp:
+    // normalizeFrequencies() with lane j holding entries j, j + 32, ... The rounding error goes to the largest
+    // frequency, the first of equals, as there. The cost in every lane.
     __device__ uint64_t streamBits(const uint16_t* q, uint32_t size, bool used, const uint32_t* hi, const uint32_t* lo,
-        uint32_t m, const uint32_t* __restrict__ cost) {
+        uint32_t m, const uint32_t* __restrict__ cost, uint32_t lane) {
         if (!used) {
             return 0;
         }
 
-        uint32_t counts[256], freqs[256];
+        constexpr uint32_t kPerLane = 256 / 32;
+        uint32_t counts[kPerLane], freqs[kPerLane];
+        uint64_t total = 0;
+
+#pragma unroll
+        for (uint32_t j = 0; j < kPerLane; j++) {
+            const uint32_t i = lane + 32 * j;
+            counts[j] = i < size ? dequantizeCount(q[i], m) : 0;
+            total += counts[j];
+        }
+
+        total = warpSum(total);
+
+        int32_t share = 0;
+
+#pragma unroll
+        for (uint32_t j = 0; j < kPerLane; j++) {
+            uint32_t f = 0;
+
+            if (counts[j] > 0) {
+                f = static_cast<uint32_t>((uint64_t(counts[j]) * kProbScale + total / 2) / total);
+                f = f > 0 ? f : 1;
+            }
+
+            freqs[j] = f;
+            share += static_cast<int32_t>(f);
+        }
+
+        int32_t diff = static_cast<int32_t>(kProbScale) - __reduce_add_sync(~0u, static_cast<uint32_t>(share));
+
+        while (diff != 0) {
+            // The largest frequency, then the lowest index, as a key: frequency above, 255 - index below.
+            uint32_t key = 0;
+
+#pragma unroll
+            for (uint32_t j = 0; j < kPerLane; j++) {
+                const uint32_t i = lane + 32 * j;
+                key = i < size ? max(key, freqs[j] << 8 | (255 - i)) : key;
+            }
+
+            key = __reduce_max_sync(~0u, key);
+
+            const uint32_t largest = 255 - (key & 255), f = key >> 8;
+            const uint32_t change = diff > 0 ? static_cast<uint32_t>(diff) : min(uint32_t(-diff), f - 1);
+            const uint32_t updated = diff > 0 ? f + change : f - change;
+
+#pragma unroll
+            for (uint32_t j = 0; j < kPerLane; j++) {
+                if (lane + 32 * j == largest) {
+                    freqs[j] = updated;
+                }
+            }
+
+            diff += diff > 0 ? -static_cast<int32_t>(change) : static_cast<int32_t>(change);
+        }
+
         uint64_t bits = 0;
 
-        for (uint32_t i = 0; i < size; i++) {
-            counts[i] = dequantizeCount(q[i], m);
+#pragma unroll
+        for (uint32_t j = 0; j < kPerLane; j++) {
+            const uint32_t i = lane + 32 * j;
+
+            if (i < size) {
+                bits += uint64_t(hi[i] - lo[i]) * __ldg(cost + freqs[j]);
+            }
         }
 
-        normalizeFrequencies(counts, size, freqs);
-
-        for (uint32_t i = 0; i < size; i++) {
-            bits += uint64_t(hi[i] - lo[i]) * __ldg(cost + freqs[i]);
-        }
-
-        return bits;
+        return warpSum(bits);
     }
 
     // The predicted q of every row entry, as codeRows() asks for them.
@@ -269,7 +426,6 @@ namespace bwarp::gpu {
         __shared__ ChooseShared s;
 
         TableData& table = *reinterpret_cast<TableData*>(s.table);
-        TableModels& models = *reinterpret_cast<TableModels*>(s.models);
         const uint32_t g = blockIdx.x, tid = threadIdx.x;
         const uint32_t slices = (n + (1u << logSlice) - 1) >> logSlice;
         const uint32_t first = g << (logSegment - logSlice);
@@ -287,8 +443,9 @@ namespace bwarp::gpu {
         __syncthreads();
 
         forEachRun(
-            bwt, n, logSlice, first, end, [&](uint8_t byte, bool, uint8_t) { atomicAdd(&s.tokens[byte], 1u); },
-            [&](uint8_t, uint32_t length) { atomicAdd(&s.lengthTotal[lengthCode(length).code], 1u); });
+            bwt, n, logSlice, first, end, [](uint32_t byte) { return byte; },
+            [&](uint32_t byte, bool, uint32_t) { atomicAdd(&s.tokens[byte], 1u); },
+            [&](uint32_t, uint32_t length) { atomicAdd(&s.lengthTotal[lengthCode(length).code], 1u); });
 
         uint32_t choices = 0;  // the K tried: 1, 2, ... up to maxContexts
 
@@ -344,14 +501,11 @@ namespace bwarp::gpu {
             __syncthreads();
 
             forEachRun(
-                bwt, n, logSlice, first, end,
-                [&](uint8_t byte, bool laneStart, uint8_t previous) {
-                    const uint32_t context =
-                        laneStart ? kMaxContexts : min(uint32_t(table.rankOf[previous]), kMaxContexts - 1);
-                    atomicAdd(&s.suffix[context][table.rankOf[byte]], 1u);
+                bwt, n, logSlice, first, end, [&](uint32_t byte) { return uint32_t(table.rankOf[byte]); },
+                [&](uint32_t rank, bool laneStart, uint32_t previous) {
+                    atomicAdd(&s.suffix[laneStart ? kMaxContexts : min(previous, kMaxContexts - 1)][rank], 1u);
                 },
-                [&](uint8_t byte, uint32_t length) {
-                    const uint32_t rank = table.rankOf[byte];
+                [&](uint32_t rank, uint32_t length) {
                     atomicAdd(&s.lengthSuffix[min(rank, kMaxLengthContexts - 1)][lengthCode(length).code], 1u);
                 });
 
@@ -409,15 +563,19 @@ namespace bwarp::gpu {
                 s.mergedLengthQ[li][l] = static_cast<uint16_t>(rowQ(s.lengthSuffix[(1u << li) - 1], lengthZero, l, m));
             }
 
-            for (uint32_t i = tid; i < sizeof(TableModels) / sizeof(Probability); i += kChooseThreads) {
-                reinterpret_cast<Probability*>(&models)[i].p = kProbScale / 2;
-            }
-
             if (tid == 0) {
                 table.contexts = 1;
                 table.mantissa = m;
                 table.lengthCodes = lengthCodes;
                 table.alphabet = alphabet;
+
+                for (uint32_t ki = 0; ki < kContextChoices; ki++) {
+                    s.merged[ki] = {0, 0};
+                }
+
+                for (uint32_t li = 0; li < kLengthChoices; li++) {
+                    s.mergedLength[li] = {0, 0};
+                }
             }
 
             __syncthreads();
@@ -509,75 +667,133 @@ namespace bwarp::gpu {
             __syncthreads();
 
             RowModels* snapshots = reinterpret_cast<RowModels*>(s.snapshots);
-            const uint32_t maxQ = maxCountQ(m);
 
-            // The serial parts: warp p codes part p of the shared rows, symbols on lane 0 and lengths on lane 1.
-            // The last warp codes the counts, then costs the stream per row.
-            static_assert(kChooseThreads / 32 > kRowParts);
+            // The stream cost of row job, by a warp: the shared rows, the merged ones, then the same for lengths.
+            const auto costStream = [&](uint32_t job, uint32_t lane) {
+                uint64_t* to;
+                uint64_t bits;
 
-            if (const uint32_t part = tid / 32; part < kRowParts && tid % 32 < 2) {
-                const bool symbol = tid % 32 == 0;
-                const uint32_t rows = symbol ? fineRows : fineLengthRows, last = symbol ? choices : lengthChoices;
-                const uint32_t size = symbol ? alphabet : lengthCodes, stride = symbol ? 256 : kMaxLengthCodes;
-                const uint16_t* q = symbol ? table.symbolQ[0] : table.lengthQ[0];
-                const uint8_t* predicted = symbol ? s.predicted[0] : s.lengthPredicted[0];
-                const bool* used = symbol ? table.symbolUsed : table.lengthUsed;
-                RowModels& rowModels = models.rows[symbol ? 0 : 1];
-                RowModels* snapshot = snapshots + (symbol ? 0 : kContextChoices);
-                RowCost* prefix = symbol ? s.prefix[part] : s.lengthPrefix[part];
-                CostCoder coder(cost);
-
-                for (uint32_t c = 0, ki = 0;; c++) {
-                    if (ki < last && c == (1u << ki) - 1) {
-                        copyRowPart(snapshot[ki], rowModels, part);
-                        prefix[ki] = {coder.bits(), coder.decisions()};
-                        ki++;
-                    }
-
-                    if (c == rows) {
-                        break;
-                    }
-
-                    costRowPart(coder, rowModels, used[c], q + c * stride, predicted + c * stride, size,
-                        symbol ? c : kMaxLengthCodes, part);
+                if (uint32_t at = job; at < fineRows) {
+                    to = &s.rowBits[at];
+                    bits = streamBits(table.symbolQ[at], alphabet, table.symbolUsed[at], s.suffix[at],
+                        s.suffix[at + 1], m, cost, lane);
+                } else if ((at -= fineRows) < choices) {
+                    to = &s.mergedBits[at];
+                    bits = streamBits(s.mergedQ[at], alphabet, s.mergedUsed[at], s.suffix[(1u << at) - 1], zero, m,
+                        cost, lane);
+                } else if ((at -= choices) < fineLengthRows) {
+                    to = &s.lengthRowBits[at];
+                    bits = streamBits(table.lengthQ[at], lengthCodes, table.lengthUsed[at], s.lengthSuffix[at],
+                        s.lengthSuffix[at + 1], m, cost, lane);
+                } else {
+                    at -= fineLengthRows;
+                    to = &s.mergedLengthBits[at];
+                    bits = streamBits(s.mergedLengthQ[at], lengthCodes, s.mergedLengthUsed[at],
+                        s.lengthSuffix[(1u << at) - 1], lengthZero, m, cost, lane);
                 }
-            } else if (tid == kChooseThreads - 32) {
-                CostCoder coder(cost);
 
-                codeCounts(coder, table, models);
-                s.counts = {coder.bits(), coder.decisions()};
-            } else if (uint32_t job = tid - (kChooseThreads - 31); tid > kChooseThreads - 32 && job < fineRows) {
-                s.rowBits[job] = streamBits(table.symbolQ[job], alphabet, table.symbolUsed[job], s.suffix[job],
-                    s.suffix[job + 1], m, cost);
-            } else if (tid > kChooseThreads - 32 && (job -= fineRows) < choices) {
-                s.mergedBits[job] =
-                    streamBits(s.mergedQ[job], alphabet, s.mergedUsed[job], s.suffix[(1u << job) - 1], zero, m, cost);
-            } else if (tid > kChooseThreads - 32 && (job -= choices) < fineLengthRows) {
-                s.lengthRowBits[job] = streamBits(table.lengthQ[job], lengthCodes, table.lengthUsed[job],
-                    s.lengthSuffix[job], s.lengthSuffix[job + 1], m, cost);
-            } else if (tid > kChooseThreads - 32 && (job -= fineLengthRows) < lengthChoices) {
-                s.mergedLengthBits[job] = streamBits(s.mergedLengthQ[job], lengthCodes, s.mergedLengthUsed[job],
-                    s.lengthSuffix[(1u << job) - 1], lengthZero, m, cost);
+                if (lane == 0) {
+                    *to = bits;
+                }
+            };
+            const uint32_t streamJobs = fineRows + choices + fineLengthRows + lengthChoices;
+
+            // Part part of last row row, from its snapshot, by a warp: symbols for K = 2^row, then lengths.
+            const auto costMerged = [&](uint32_t row, uint32_t part, uint32_t lane) {
+                const bool symbol = row < choices;
+                const uint32_t ki = symbol ? row : row - choices;
+                LaneCells cells;
+
+                cells.load(snapshots[symbol ? ki : kContextChoices + ki], part, lane);
+
+                if (symbol) {
+                    costRowPart(cells, cost, s.mergedUsed[ki], s.mergedQ[ki], s.mergedPredicted[ki], alphabet, 256,
+                        part, lane);
+                } else {
+                    costRowPart(cells, cost, s.mergedLengthUsed[ki], s.mergedLengthQ[ki], s.mergedLengthPredicted[ki],
+                        lengthCodes, kMaxLengthCodes, part, lane);
+                }
+
+                const uint32_t bits = __reduce_add_sync(~0u, cells.bits);
+                const uint32_t decisions = __reduce_add_sync(~0u, cells.decisions);
+
+                if (lane == 0) {
+                    RowCost& to = symbol ? s.merged[ki] : s.mergedLength[ki];
+                    atomicAdd(reinterpret_cast<unsigned long long*>(&to.bits), static_cast<unsigned long long>(bits));
+                    atomicAdd(&to.decisions, decisions);
+                }
+            };
+
+            // The serial parts: warp p codes part p of the shared rows, the symbol rows, then the length rows. The
+            // residual parts' warps, done sooner, then code their parts of the last rows and cost the streams, and
+            // the last one also codes the counts.
+            static_assert(kChooseThreads / 32 == kRowParts);
+
+            if (const uint32_t part = tid / 32, lane = tid % 32; part < kRowParts) {
+                for (uint32_t kind = 0; kind < 2; kind++) {
+                    const bool symbol = kind == 0;
+                    const uint32_t rows = symbol ? fineRows : fineLengthRows, last = symbol ? choices : lengthChoices;
+                    const uint32_t size = symbol ? alphabet : lengthCodes, stride = symbol ? 256 : kMaxLengthCodes;
+                    const uint16_t* q = symbol ? table.symbolQ[0] : table.lengthQ[0];
+                    const uint8_t* predicted = symbol ? s.predicted[0] : s.lengthPredicted[0];
+                    const bool* used = symbol ? table.symbolUsed : table.lengthUsed;
+                    RowModels* snapshot = snapshots + (symbol ? 0 : kContextChoices);
+                    RowCost* prefix = symbol ? s.prefix[part] : s.lengthPrefix[part];
+                    LaneCells cells;
+
+                    for (uint32_t c = 0, ki = 0;; c++) {
+                        if (ki < last && c == (1u << ki) - 1) {
+                            const uint32_t bits = __reduce_add_sync(~0u, cells.bits);
+                            const uint32_t decisions = __reduce_add_sync(~0u, cells.decisions);
+
+                            cells.save(snapshot[ki], part, lane);
+
+                            if (lane == 0) {
+                                prefix[ki] = {bits, decisions};
+                            }
+
+                            ki++;
+                        }
+
+                        if (c == rows) {
+                            break;
+                        }
+
+                        costRowPart(cells, cost, used[c], q + c * stride, predicted + c * stride, size,
+                            symbol ? c : kMaxLengthCodes, part, lane);
+                    }
+                }
+
+                for (uint32_t row = 0; part >= kZeroParts && row < choices + lengthChoices; row++) {
+                    costMerged(row, part, lane);  // from the snapshots this warp wrote
+                }
+
+                if (part == kRowParts - 1) {
+                    // codeCounts(): K in 4 raw bits, m in 2, then the counts of bytes and of length codes.
+                    LaneCells bytes, lengthTotals;
+
+                    costMarginal(bytes, cost, table.byteQ, 256, lane);
+                    costMarginal(lengthTotals, cost, table.lengthCodeQ, lengthCodes, lane);
+
+                    const uint32_t bits = __reduce_add_sync(~0u, bytes.bits + lengthTotals.bits);
+                    const uint32_t decisions = __reduce_add_sync(~0u, bytes.decisions + lengthTotals.decisions);
+
+                    if (lane == 0) {
+                        s.counts = {bits + 6ull * __ldg(cost + kProbScale / 2), decisions + 6};
+                    }
+                }
+
+                for (uint32_t job = part - kZeroParts; part >= kZeroParts && job < streamJobs; job += kResidualContexts) {
+                    costStream(job, lane);
+                }
             }
 
             __syncthreads();
 
-            // Each last row from its snapshot, a thread each, spread over the warps.
-            if (const uint32_t job = tid % 32 * (kChooseThreads / 32) + tid / 32; job < choices + lengthChoices) {
-                const bool symbol = job < choices;
-                const uint32_t ki = symbol ? job : job - choices;
-                CostCoder coder(cost);
-
-                if (symbol) {
-                    codeRow(coder, snapshots[ki], s.mergedUsed[ki], s.mergedQ[ki], alphabet, 256,
-                        [&](uint32_t i) { return uint32_t(s.mergedPredicted[ki][i]); }, maxQ);
-                    s.merged[ki] = {coder.bits(), coder.decisions()};
-                } else {
-                    codeRow(coder, snapshots[kContextChoices + ki], s.mergedLengthUsed[ki], s.mergedLengthQ[ki],
-                        lengthCodes, kMaxLengthCodes, [&](uint32_t i) { return uint32_t(s.mergedLengthPredicted[ki][i]); },
-                        maxQ);
-                    s.mergedLength[ki] = {coder.bits(), coder.decisions()};
-                }
+            // The zero parts of each last row, a warp per row and part.
+            for (uint32_t job = tid / 32, lane = tid % 32; job < (choices + lengthChoices) * kZeroParts;
+                 job += kChooseThreads / 32) {
+                costMerged(job / kZeroParts, job % kZeroParts, lane);
             }
 
             __syncthreads();
