@@ -28,7 +28,7 @@ Offsets are absolute file positions. Table g occupies [segment offset g, g + 1),
 
 A slice of B bytes is split into 32 lanes of `L = ceil(B / 32)` contiguous bytes; lane j covers [j × L, min((j + 1) × L, B)) of the slice and may be empty. Each lane is cut into maximal runs, and each run becomes a token (symbol, length). Runs never cross a lane.
 
-**Symbols** are coded as their rank in the segment's alphabet, which lists the bytes that start a token in the segment by token count, descending, ties by byte value.
+**Symbols** are coded as their rank in the segment's alphabet, which lists the bytes that start a token in the segment by quantized token count, descending, ties by byte value (see [Tables](#tables)).
 
 **Lengths** 1 to 8 have codes 0 to 7. A longer length with `lg = floor(log2(length))` and `hi` the bit below its top bit has code `8 + 2 × (lg − 3) + hi` and `lg − 1` extra bits, the length's low `lg − 1` bits. With slices of at most 2^17 bytes a lane holds at most 4096 bytes, so a run has at most 11 extra bits. The number of length codes is that of the longest possible run, `code(L_max) + 1` with `L_max = ceil(2^logSlice / 32)`.
 
@@ -36,17 +36,61 @@ A slice of B bytes is split into 32 lanes of `L = ceil(B / 32)` contiguous bytes
 
 ## Tables
 
-Bit-packed, least significant bit first, padded to a byte:
+A table holds quantized token counts, from which the decoder derives the ranks and the frequencies. Each segment's table is coded on its own, so tables decode in parallel.
 
-- alphabet size − 1, 8 bits;
-- the alphabet in rank order, 8 bits per byte;
-- K − 1, 4 bits;
-- for each symbol context: a used bit, and if set, the alphabet's frequencies;
-- for each length context: a used bit, and if set, the frequencies of all length codes.
+### Binary coder
 
-Each frequency f is written as the Elias gamma code of f + 1 (`floor(log2(v))` zeros, a one, then the low `floor(log2(v))` bits of v). A used context's frequencies sum to 4096. A context whose bit is clear must not occur.
+A table is a sequence of binary decisions coded with one rANS state, the same primitives as the streams: the final encoder state (u32), then 16-bit words in reading order. A decision with probability p (of a 0, in units of 2^-12) decodes as
 
-The encoder scales the counts by rounding, gives every nonzero count at least 1 and corrects the sum on the largest frequencies (`normalizeFrequencies`). Decoders only need the frequencies.
+```
+bit = (x & 4095) >= p
+x = bit ? (4096 − p) × (x >> 12) + (x & 4095) − p : p × (x >> 12) + (x & 4095)
+if x < 2^16: x = (x << 16) | next word
+```
+
+An adaptive probability starts at 2048 and after each decision becomes `p + ((4096 − p) >> 3)` after a 0, `p − (p >> 3)` after a 1. Raw bits use p = 2048 and come most significant first. A valid table ends with every word read and the state at 2^16.
+
+**Integers** v ≥ 0 are coded as Exp-Golomb codes of u = v + 1: with b = floor(log2(u)), b decisions of 1 and a 0 (decision i uses `length[i]`; after 15 ones the 0 is left out), then u's b bits below its top one, most significant first; the first uses `top[b]`, the others are raw. Signed values s are coded as v = 2s for s ≥ 0, −2s − 1 otherwise.
+
+### Quantized counts
+
+With m mantissa bits, a count c is stored as q = c below 2^m, otherwise, with e = floor(log2(c)),
+
+```
+q = ((e − m + 1) << m) + ((c >> (e − m)) & (2^m − 1))
+```
+
+Below 2^m, q stands for itself. Otherwise q stands for the middle of its step: with s = (q >> m) − 1, `(((q & (2^m − 1)) | 2^m) << s) + ((1 << s) >> 1)`. A valid q is at most q(2^24).
+
+### Contents
+
+1. K − 1, 4 raw bits.
+2. m, 2 raw bits.
+3. The byte counts: tokens per byte value, for bytes 0 to 255.
+4. The length-code counts: tokens per length code.
+5. For each symbol context 0 to K − 1, its row of counts by rank.
+6. For each length context 0 to K − 1, its row of counts by length code.
+
+**Count lists** (3, 4) code each entry as a decision "nonzero", whose probability is chosen by whether the previous entry was zero (the first entry counts as following a zero), then for a nonzero entry the signed difference from the previous nonzero q in the list (0 at the start). Lists 3 and 4 each have their own probabilities.
+
+The **ranks** are the bytes with a nonzero count, by q descending, ties by byte value.
+
+**Rows** (5, 6) are predicted from the lists as if symbol and context were independent. With R[r] the dequantized count of rank r, N their sum, L[l] that of length code l, LN their sum, and T[c] the sum of R[r] over the ranks r with `bucket(r) = c`:
+
+- symbol context c: total T[c], weights R, divisor N − R[c] for c < K − 1, otherwise N. For c < K − 1, entry c is left out: a lane's run never follows one of the same byte.
+- length context c: total T[c], weights L, divisor LN.
+
+An entry's prediction is `(total × weight + divisor / 2) / divisor` (0 if the divisor is 0), at most 2^24, and p its q.
+
+Each row starts with a decision "used". An unused row is all zero and its context must not occur. In a used row each entry is a decision "nonzero", with the probability for min(p, 31), and for a nonzero entry the signed difference from max(p, 1), as an integer with the probabilities for min(floor(log2(p + 1)), 5). A used row has a nonzero entry. Symbol rows and length rows each have their own probabilities.
+
+All probabilities start afresh for each table.
+
+### Frequencies
+
+A used row's dequantized counts are scaled to frequencies summing to 4096: each is rounded, at least 1 if nonzero, and the difference to 4096 is added to the largest or taken from the largest repeatedly, leaving each at least 1 (`normalizeFrequencies`).
+
+The encoder picks K and m per table; the reference tries K ∈ {1, 2, 4, 8, 16} up to its limit and m ∈ {0, 1}, and keeps the pair with the fewest table bits plus estimated stream bits.
 
 ## Streams
 

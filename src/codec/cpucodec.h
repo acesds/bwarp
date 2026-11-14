@@ -15,9 +15,9 @@
 #include <vector>
 
 struct EncodeParams {
-    int logSegment = 20;  // frequency tables per 2^logSegment bytes
+    int logSegment = 15;  // frequency tables per 2^logSegment bytes
     int logSlice = 15;    // one 32-lane rANS stream per 2^logSlice bytes
-    int contexts = 8;
+    int contexts = 16;    // at most; each segment's table picks its own
 };
 
 struct EncodeStats {

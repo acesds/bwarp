@@ -105,6 +105,35 @@ namespace bwarp {
         return freq * (x >> kProbBits) + (x & (kProbScale - 1)) - cum;
     }
 
+    // Tables store counts as floats with `mantissa` bits below the top one: exact below 2^(mantissa + 1),
+    // then 2^mantissa steps per octave. Dequantizing gives the middle of the step.
+    constexpr uint32_t kMaxCountMantissa = 3;
+
+    BWARP_HD uint32_t quantizeCount(uint32_t count, uint32_t mantissa) {
+        if (count < (1u << mantissa)) {
+            return count;
+        }
+
+        const uint32_t lg = floorLog2(count);
+        return ((lg - mantissa + 1) << mantissa) + ((count >> (lg - mantissa)) & ((1u << mantissa) - 1));
+    }
+
+    BWARP_HD uint32_t dequantizeCount(uint32_t q, uint32_t mantissa) {
+        if (q < (1u << mantissa)) {
+            return q;
+        }
+
+        const uint32_t shift = (q >> mantissa) - 1;
+        return (((q & ((1u << mantissa) - 1)) | (1u << mantissa)) << shift) + ((1u << shift) >> 1);
+    }
+
+    // The table coder's adaptive binary decisions. p is the probability of a 0 bit, in units of 2^-kProbBits.
+    constexpr uint32_t kAdaptShift = 3;
+
+    BWARP_HD uint32_t adaptProbability(uint32_t p, uint32_t bit) {
+        return bit ? p - (p >> kAdaptShift) : p + ((kProbScale - p) >> kAdaptShift);
+    }
+
     // Scales counts[0, size), summing to more than 0, to frequencies summing to kProbScale.
     // Every nonzero count gets a nonzero frequency; the rounding error goes to the largest ones.
     BWARP_HD void normalizeFrequencies(const uint32_t* counts, uint32_t size, uint32_t* freqs) {

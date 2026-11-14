@@ -191,13 +191,28 @@ namespace {
             }
         }
 
+        // A flipped byte must be refused or decode to as many bytes as the header says, never crash.
+        suite.cases++;
+
+        for (size_t at = 0; at < encoded.size(); at += std::max<size_t>(1, encoded.size() / 89)) {
+            std::vector<uint8_t> corrupt = encoded;
+            corrupt[at] ^= 0x5a;
+
+            const size_t n = corrupt[8] | corrupt[9] << 8 | corrupt[10] << 16 | size_t(corrupt[11]) << 24;
+
+            if (decodeBwt(corrupt.data(), corrupt.size(), decoded, primary) && decoded.size() != n) {
+                suite.reportFailure(label + ", corrupted", "wrong size", static_cast<int64_t>(at));
+                return;
+            }
+        }
+
         if (suite.verbose) {
             printf("  ok   %s, %zu -> %zu bytes\n", label.c_str(), input.size(), encoded.size());
         }
     }
 
     void runCodecCases(Suite& suite) {
-        const EncodeParams paramSets[] = {{20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {17, 17, 16}, {24, 12, 2}};
+        const EncodeParams paramSets[] = {{15, 15, 16}, {20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {17, 17, 16}, {24, 12, 2}};
         Rng rng{5};
         std::vector<std::pair<std::string, std::vector<uint8_t>>> inputs = {
             {"\"\"", {}},
