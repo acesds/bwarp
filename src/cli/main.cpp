@@ -721,7 +721,7 @@ namespace {
 
                 ok = decoded == text;
 
-                const double inverse = stats.sortSeconds + stats.chainSeconds;
+                const double inverse = stats.rankSeconds + stats.chainSeconds;
                 const double device = stats.tableSeconds + stats.finishSeconds + stats.streamSeconds + inverse;
 
                 if (r == 0 || device < run.gpuSeconds) {
@@ -731,10 +731,10 @@ namespace {
                 }
 
                 if (options.verbose && r == 1) {
-                    printf("  GPU: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, psi %.2f ms, "
+                    printf("  GPU: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, LF %.2f ms, "
                            "chains %.2f ms, download %.2f ms, %lld MiB\n",
                         1e3 * stats.uploadSeconds, 1e3 * stats.tableSeconds, 1e3 * stats.finishSeconds,
-                        1e3 * stats.streamSeconds, 1e3 * stats.sortSeconds, 1e3 * stats.chainSeconds,
+                        1e3 * stats.streamSeconds, 1e3 * stats.rankSeconds, 1e3 * stats.chainSeconds,
                         1e3 * stats.downloadSeconds, static_cast<long long>(stats.deviceBytes >> 20));
                 }
             }

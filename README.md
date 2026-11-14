@@ -12,7 +12,7 @@ What exists so far:
 - sadcs's GPU BWT construction and its BWT checker, BWT path only (see [From sadcs](#from-sadcs)).
 - Format v0 ([docs/format.md](docs/format.md)) with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
 - The GPU decoder, byte for byte the same as the CPU one, valid input or not.
-- The GPU inverse BWT, so decompression runs entirely on the device: psi from a stable radix sort of the BWT, then one chain per sampled row that the construction records.
+- The GPU inverse BWT, so decompression runs entirely on the device: LF from a stable ranking of the BWT, then one chain per sampled row that the construction records, walked backward (from both ends, with psi too, when there are few).
 - The command line and a selftest.
 
 Next: the GPU encoder.

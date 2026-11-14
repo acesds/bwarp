@@ -93,7 +93,7 @@ struct GpuDecodeStats {
     double tableSeconds = 0.0;   // decoding the tables
     double finishSeconds = 0.0;  // their frequencies and slot tables
     double streamSeconds = 0.0;
-    double sortSeconds = 0.0;   // gpuDecompress(): the inverse BWT's psi
+    double rankSeconds = 0.0;   // gpuDecompress(): the inverse BWT's LF
     double chainSeconds = 0.0;  // and its chains
     double downloadSeconds = 0.0;
 };

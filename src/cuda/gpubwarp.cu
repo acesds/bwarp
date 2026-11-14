@@ -747,8 +747,7 @@ namespace {
         return GpuStatus::Ok;
     }
 
-    // The text of d.bwt into text, which holds the sort's indices first (at least 16 bytes, for the text's
-    // 16-byte stores). n > 0.
+    // The text of d.bwt into text (at least 16 bytes, for its 16-byte stores). n > 0.
     GpuStatus invertOnDevice(DeviceDecode& d, DeviceArray<uint32_t>& text, GpuDecodeStats& s) {
         using namespace bwarp;
 
@@ -756,23 +755,22 @@ namespace {
         const uint32_t n = layout.n;
         const uint32_t chains = layout.samples + 1;
         const uint32_t primary = static_cast<uint32_t>(d.container.primary);
+        const uint32_t tiles = (n + gpu::kRankTile - 1) / gpu::kRankTile;
+        const bool both = chains <= gpu::kMaxBidirectionalChains;
         auto start = std::chrono::steady_clock::now();
         cudaError_t error;
-        DeviceArray<uint8_t> sortedKeys, temp;
-        DeviceArray<uint32_t>& indices = text;
-        DeviceArray<uint32_t> psi, counts, samples;
-        size_t sortBytes = 0, histogramBytes = 0;
+        DeviceArray<uint8_t> temp;
+        DeviceArray<uint32_t> lf, psi, offsets, samples;
+        size_t scanBytes = 0;
 
-        if ((error = cub::DeviceRadixSort::SortPairs(nullptr, sortBytes, d.bwt.get(), sortedKeys.get(), indices.get(),
-                 psi.get(), n, 0, 8)) != cudaSuccess ||
-            (error = cub::DeviceHistogram::HistogramEven(nullptr, histogramBytes, d.bwt.get(), counts.get(), 257, 0u,
-                 256u, n)) != cudaSuccess ||
-            (error = sortedKeys.allocate(n, s.deviceBytes)) != cudaSuccess ||
-            (error = indices.allocate(std::max<size_t>(n, 4), s.deviceBytes)) != cudaSuccess ||
-            (error = psi.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess ||
-            (error = counts.allocate(256, s.deviceBytes)) != cudaSuccess ||
+        if ((error = cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, offsets.get(), offsets.get(),
+                 256 * tiles)) != cudaSuccess ||
+            (error = lf.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess ||
+            (both && (error = psi.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess) ||
+            (error = offsets.allocate(size_t(256) * tiles, s.deviceBytes)) != cudaSuccess ||
             (error = samples.allocate(layout.samples, s.deviceBytes)) != cudaSuccess ||
-            (error = temp.allocate(std::max(sortBytes, histogramBytes), s.deviceBytes)) != cudaSuccess ||
+            (error = temp.allocate(scanBytes, s.deviceBytes)) != cudaSuccess ||
+            (error = text.allocate((size_t(n) + 15) / 4 & ~size_t(3), s.deviceBytes)) != cudaSuccess ||
             (layout.samples > 0 &&
                 (error = cudaMemcpy(samples.get(), d.container.samples.data(), size_t(layout.samples) * 4,
                      cudaMemcpyHostToDevice)) != cudaSuccess) ||
@@ -783,32 +781,29 @@ namespace {
         s.setupSeconds += secondsSince(start);
         start = std::chrono::steady_clock::now();
 
-        const uint32_t blocks = (n + 1 + gpu::kInverseThreads - 1) / gpu::kInverseThreads;
-
-        gpu::iota<<<blocks, gpu::kInverseThreads>>>(indices.get(), n);
+        gpu::countTiles<<<tiles, gpu::kInverseThreads>>>(d.bwt.get(), n, tiles, offsets.get());
 
         if ((error = cudaGetLastError()) != cudaSuccess ||
-            (error = cub::DeviceRadixSort::SortPairs(temp.get(), sortBytes, d.bwt.get(), sortedKeys.get(),
-                 indices.get(), psi.get() + 1, n, 0, 8)) != cudaSuccess ||
-            (error = cub::DeviceHistogram::HistogramEven(temp.get(), histogramBytes, d.bwt.get(), counts.get(), 257,
-                 0u, 256u, n)) != cudaSuccess) {
-            return failed("inverse sort", error);
+            (error = cub::DeviceScan::ExclusiveSum(temp.get(), scanBytes, offsets.get(), offsets.get(),
+                 256 * tiles)) != cudaSuccess) {
+            return failed("inverse ranking", error);
         }
 
-        gpu::finishPsi<<<blocks, gpu::kInverseThreads>>>(psi.get(), n, primary);
+        gpu::rankTiles<<<tiles, gpu::kInverseThreads>>>(d.bwt.get(), n, tiles, offsets.get(), primary, lf.get(),
+            both ? psi.get() : nullptr);
 
         if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
-            return failed("inverse sort", error);
+            return failed("inverse ranking", error);
         }
 
-        s.sortSeconds = secondsSince(start);
+        s.rankSeconds = secondsSince(start);
         start = std::chrono::steady_clock::now();
 
-        const uint32_t chainBlocks = (chains + gpu::kInverseThreads - 1) / gpu::kInverseThreads;
-        const uint32_t logSample = static_cast<uint32_t>(layout.logSample);
+        const uint32_t threads = both ? (chains + 31) / 32 * 64 : chains;
 
-        gpu::walkChains<<<chainBlocks, gpu::kInverseThreads>>>(psi.get(), counts.get(), samples.get(), primary, n,
-            logSample, chains, reinterpret_cast<uint8_t*>(text.get()));
+        gpu::walkChains<<<(threads + gpu::kInverseThreads - 1) / gpu::kInverseThreads, gpu::kInverseThreads>>>(
+            lf.get(), both ? psi.get() : nullptr, offsets.get(), tiles, samples.get(), primary, n,
+            static_cast<uint32_t>(layout.logSample), chains, reinterpret_cast<uint8_t*>(text.get()));
 
         if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
             return failed("inverse chains", error);

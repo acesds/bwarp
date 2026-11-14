@@ -23,7 +23,7 @@ A bwarp file holds the BWT of one block of up to 2^31 − 1 bytes. All integers 
 
 The BWT is that of the text plus a sentinel smaller than every byte, with the sentinel left out, so it has n bytes.
 
-**Samples** let the inverse BWT run as many independent chains. Counting the n + 1 sorted rotations from 0 (the one starting with the sentinel), sample j − 1 is the row of the rotation starting at text position j × 2^logSample, for 1 ≤ j and j × 2^logSample < n, so there are `samples = floor((n − 1) / 2^logSample)` of them (0 for n = 0). primary is the row of position 0. Every row is in [1, n] (primary is 0 for n = 0). Chain j decodes positions [j × 2^logSample, (j + 1) × 2^logSample) forward from its row.
+**Samples** let the inverse BWT run as many independent chains. Counting the n + 1 sorted rotations from 0 (the one starting with the sentinel), sample j − 1 is the row of the rotation starting at text position j × 2^logSample, for 1 ≤ j and j × 2^logSample < n, so there are `samples = floor((n − 1) / 2^logSample)` of them (0 for n = 0). primary is the row of position 0. Every row is in [1, n] (primary is 0 for n = 0). A chain can decode positions [j × 2^logSample, (j + 1) × 2^logSample) forward from the row of its start or backward from that of its end (row 0 for position n).
 
 bwarp's encoder picks the smallest logSample in [10, 16] that gives at most 2^13 chains or whose samples take at most 1/128 of the tables and streams.
 
