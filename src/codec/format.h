@@ -15,8 +15,10 @@
 
 #if defined(__CUDACC__)
 #define BWARP_HD __host__ __device__ __forceinline__ constexpr
+#define BWARP_HOST_DEVICE __host__ __device__
 #else
 #define BWARP_HD constexpr
+#define BWARP_HOST_DEVICE
 #endif
 
 namespace bwarp {
@@ -36,6 +38,7 @@ namespace bwarp {
     constexpr uint32_t kRansLow = 1u << 16;  // states stay in [kRansLow, 2^32); I/O in 16-bit words
 
     constexpr uint32_t kDirectLengths = 8;
+    constexpr uint32_t kMaxLengthCodes = 32;
 
     BWARP_HD uint32_t floorLog2(uint32_t x) {
 #if defined(__CUDA_ARCH__)
@@ -94,6 +97,12 @@ namespace bwarp {
 
     // Run lengths use only the first contexts.
     constexpr uint32_t kMaxLengthContexts = 4;
+
+#if !defined(__CUDA_ARCH__)  // __clz is not constexpr
+    static_assert(lengthCode(laneBytes(1u << kMaxLogSlice)).code < kMaxLengthCodes);
+    static_assert(lengthExtraBits(lengthCode(laneBytes(1u << kMaxLogSlice)).code) <= kProbBits,
+        "a run's extra bits must fit one rANS op");
+#endif
 
     BWARP_HD uint32_t lengthContexts(uint32_t contexts) {
         return contexts < kMaxLengthContexts ? contexts : kMaxLengthContexts;

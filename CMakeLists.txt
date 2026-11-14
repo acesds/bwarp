@@ -43,6 +43,8 @@ set(COMMON_SOURCES
 # The format's shared primitives (format) and its reference encoder and decoder (cpucodec).
 set(CODEC_SOURCES
     src/codec/format.h
+    src/codec/table.h
+    src/codec/container.h
     src/codec/cpucodec.h
     src/codec/cpucodec.cpp
 )
@@ -74,13 +76,14 @@ source_group(TREE "${CMAKE_SOURCE_DIR}/src" FILES ${BWARP_SOURCES})
 # The .cuh files are sadcs's GPU BWT construction (BWT path only), all in gpubwarp.cu's translation unit.
 if(CMAKE_CUDA_COMPILER)
     add_library(bwarp_cuda STATIC src/cuda/gpubwarp.h src/cuda/gpubwarp.cu src/cuda/differencecover.h
-        src/cuda/devicecommon.cuh src/cuda/samplerank.cuh src/cuda/classsort.cuh src/cuda/merge.cuh)
+        src/cuda/devicecommon.cuh src/cuda/samplerank.cuh src/cuda/classsort.cuh src/cuda/merge.cuh
+        src/cuda/decode.cuh)
     set_target_properties(bwarp_cuda PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "120-real;120-virtual"
     )
-    target_include_directories(bwarp_cuda PRIVATE src/common)
+    target_include_directories(bwarp_cuda PRIVATE src/common src/codec)
     if(MSVC)
         # CCCL 3 refuses cl.exe's traditional preprocessor.
         target_compile_options(bwarp_cuda PRIVATE -Xcompiler=/Zc:preprocessor,/utf-8)

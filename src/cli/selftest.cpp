@@ -162,7 +162,23 @@ namespace {
 
     // ---- codec ---------------------------------------------------------------------------------
 
-    void testCodec(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, const EncodeParams& params) {
+    // The GPU decoder must accept exactly what the CPU decoder accepts, with the same result.
+    bool sameAsCpu(const std::vector<uint8_t>& encoded, size_t size) {
+        std::vector<uint8_t> cpu, gpu;
+        int32_t cpuPrimary = -1, gpuPrimary = -1;
+        const bool cpuOk = decodeBwt(encoded.data(), size, cpu, cpuPrimary);
+        const GpuStatus status = gpuDecode(encoded.data(), size, gpu, gpuPrimary);
+
+        if (status != GpuStatus::Ok && status != GpuStatus::Invalid) {
+            printf("  GPU decoder: %s\n", gpuLastError());
+            return false;
+        }
+
+        return cpuOk == (status == GpuStatus::Ok) && (!cpuOk || (cpu == gpu && cpuPrimary == gpuPrimary));
+    }
+
+    void testCodec(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, const EncodeParams& params,
+        bool gpu) {
         const int32_t n = static_cast<int32_t>(input.size());
         const std::string label = name + " (2^" + std::to_string(params.logSegment) + ", 2^" +
                                   std::to_string(params.logSlice) + ", " + std::to_string(params.contexts) + ")";
@@ -181,11 +197,16 @@ namespace {
             return;
         }
 
+        if (gpu && !sameAsCpu(encoded, encoded.size())) {
+            suite.reportFailure(label, "GPU decoder differs", -1);
+            return;
+        }
+
         // Every truncation must be refused.
         suite.cases++;
 
         for (size_t size = 0; size < encoded.size(); size += std::max<size_t>(1, encoded.size() / 97)) {
-            if (decodeBwt(encoded.data(), size, decoded, primary)) {
+            if (decodeBwt(encoded.data(), size, decoded, primary) || (gpu && !sameAsCpu(encoded, size))) {
                 suite.reportFailure(label + ", truncated", "not refused", static_cast<int64_t>(size));
                 return;
             }
@@ -202,6 +223,11 @@ namespace {
 
             if (decodeBwt(corrupt.data(), corrupt.size(), decoded, primary) && decoded.size() != n) {
                 suite.reportFailure(label + ", corrupted", "wrong size", static_cast<int64_t>(at));
+                return;
+            }
+
+            if (gpu && !sameAsCpu(corrupt, corrupt.size())) {
+                suite.reportFailure(label + ", corrupted", "GPU decoder differs", static_cast<int64_t>(at));
                 return;
             }
         }
@@ -233,9 +259,14 @@ namespace {
 
         inputs.push_back({"random runs", runs});
 
+        GpuDevice device;
+        const bool gpu = gpuQueryDevice(device) == GpuStatus::Ok;
+
+        printf("selftest: codec round trips, truncations and corruptions%s...\n", gpu ? ", CPU and GPU decoders" : "");
+
         for (const EncodeParams& params : paramSets) {
             for (const auto& [name, input] : inputs) {
-                testCodec(suite, name, input, params);
+                testCodec(suite, name, input, params, gpu);
             }
         }
     }
@@ -357,7 +388,6 @@ int runSelfTest(bool verbose) {
 
     printf("selftest: checker on known BWTs and planted errors...\n");
     runCheckerCases(suite);
-    printf("selftest: codec round trips and truncations...\n");
     runCodecCases(suite);
     runGpuCases(suite);
 

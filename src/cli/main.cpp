@@ -38,6 +38,7 @@ namespace {
         int runs = 5;
         bool context = false;
         bool pinned = false;
+        bool gpu = false;
         EncodeParams encode;
     };
 
@@ -72,7 +73,8 @@ namespace {
             "  bwarp check <in> <in.bwt>\n"
             "  bwarp test <in|dir> [--recursive]\n"
             "  bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]\n"
-            "  bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--recursive]\n"
+            "  bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--gpu [--verbose]]\n"
+            "              [--recursive]\n"
             "  bwarp selftest [--verbose]\n"
             "\n"
             "The .bwt file is divsufsort's bwt format as one block: n, the primary index, the n bytes\n"
@@ -89,7 +91,9 @@ namespace {
             "ratio builds the BWT on the GPU, encodes and decodes it with the CPU reference codec,\n"
             "checks the round trip and prints the compressed sizes. --segment (default 15): frequency\n"
             "tables per 2^LOG2 bytes; --slice (default 15, 10 to 16): one 32-lane stream per 2^LOG2\n"
-            "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use.\n");
+            "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use.\n"
+            "--gpu also decodes on the GPU, checks it, and prints its speed without transfers (the\n"
+            "faster of two runs) and that of its stream kernel; --verbose adds the phases.\n");
     }
 
     bool parseOptions(int argc, char** argv, Options& options) {
@@ -111,6 +115,8 @@ namespace {
                 options.encode.contexts = atoi(argv[++i]);
             } else if (strcmp(arg, "--context") == 0) {
                 options.context = true;
+            } else if (strcmp(arg, "--gpu") == 0) {
+                options.gpu = true;
             } else if (strcmp(arg, "--pinned") == 0) {
                 options.pinned = true;
             } else if (strcmp(arg, "--recursive") == 0) {
@@ -159,6 +165,7 @@ namespace {
             printf("bwarp: GPU %s: %s\n",
                 status == GpuStatus::Unavailable       ? "unavailable"
                 : status == GpuStatus::NotEnoughMemory ? "out of memory"
+                : status == GpuStatus::Invalid         ? "rejected the input"
                                                        : "failed",
                 gpuLastError());
             return false;
@@ -587,6 +594,8 @@ namespace {
         int64_t compressed = 0;
         double encodeSeconds = 0.0;
         double decodeSeconds = 0.0;
+        double gpuSeconds = 0.0;  // the decoder's device phases
+        double gpuStreamSeconds = 0.0;
 
         void add(const RatioRun& other) {
             bytes += other.bytes;
@@ -597,18 +606,27 @@ namespace {
             compressed += other.compressed;
             encodeSeconds += other.encodeSeconds;
             decodeSeconds += other.decodeSeconds;
+            gpuSeconds += other.gpuSeconds;
+            gpuStreamSeconds += other.gpuStreamSeconds;
         }
     };
 
-    void printRatioRow(const char* name, int nameWidth, const RatioRun& run, const char* verdict) {
+    void printRatioRow(const char* name, int nameWidth, const RatioRun& run, bool gpu, const char* verdict) {
         const auto percent = [&](int64_t part) { return run.compressed > 0 ? 100.0 * part / run.compressed : 0.0; };
 
-        printf("%-*s %12lld %12lld %6.3f %8.4f %6.2f %6.2f %8.1f %8.1f  %s\n", nameWidth, name,
+        printf("%-*s %12lld %12lld %6.3f %8.4f %6.2f %6.2f %8.1f %8.1f", nameWidth, name,
             static_cast<long long>(run.bytes), static_cast<long long>(run.compressed),
             run.bytes > 0 ? 8.0 * run.compressed / run.bytes : 0.0,
             run.bytes > 0 ? static_cast<double>(run.stats.tokens) / run.bytes : 0.0, percent(run.stats.tableBytes),
             percent(run.stats.indexBytes), megabytesPerSecond(run.bytes, run.encodeSeconds),
-            megabytesPerSecond(run.bytes, run.decodeSeconds), verdict);
+            megabytesPerSecond(run.bytes, run.decodeSeconds));
+
+        if (gpu) {
+            printf(" %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuSeconds),
+                megabytesPerSecond(run.bytes, run.gpuStreamSeconds));
+        }
+
+        printf("  %s\n", verdict);
     }
 
     int cmdRatio(const Options& options) {
@@ -628,8 +646,9 @@ namespace {
 
         printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts (CPU reference codec)\n", options.paths[0],
             files.size(), files.size() == 1 ? "" : "s", params.logSegment, params.logSlice, params.contexts);
-        printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s\n", nameWidth, "file", "bytes", "compressed", "bpc",
-            "runs/n", "tab%", "idx%", "enc MB/s", "dec MB/s");
+        printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s", nameWidth, "file", "bytes", "compressed", "bpc", "runs/n",
+            "tab%", "idx%", "enc MB/s", "dec MB/s");
+        printf(options.gpu ? " %8s %8s\n" : "\n", "gpu MB/s", "str MB/s");
 
         RatioRun total;
         size_t passed = 0;
@@ -660,16 +679,44 @@ namespace {
             run.bytes = n;
             run.compressed = static_cast<int64_t>(encoded.size());
 
-            const bool ok = decodedOk && decodedPrimary == primary && decoded == text;
+            bool ok = decodedOk && decodedPrimary == primary && decoded == text;
 
-            printRatioRow(names[i].c_str(), nameWidth, run, ok ? "OK" : "FAILED");
+            // The faster of two runs, the first one warming up.
+            for (int r = 0; options.gpu && ok && r < 2; r++) {
+                GpuDecodeStats stats;
+                const GpuStatus status = gpuDecode(encoded.data(), encoded.size(), decoded, decodedPrimary, &stats);
+
+                if (!reportGpu(status)) {
+                    ok = false;
+                    break;
+                }
+
+                ok = decodedPrimary == primary && decoded == text;
+
+                const double device = stats.tableSeconds + stats.finishSeconds + stats.streamSeconds;
+
+                if (r == 0 || device < run.gpuSeconds) {
+                    run.gpuSeconds = device;
+                    run.gpuStreamSeconds = stats.streamSeconds;
+                }
+
+                if (options.verbose && r == 1) {
+                    printf("  GPU decoder: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, "
+                           "download %.2f ms, %lld MiB\n",
+                        1e3 * stats.uploadSeconds, 1e3 * stats.tableSeconds, 1e3 * stats.finishSeconds,
+                        1e3 * stats.streamSeconds, 1e3 * stats.downloadSeconds,
+                        static_cast<long long>(stats.deviceBytes >> 20));
+                }
+            }
+
+            printRatioRow(names[i].c_str(), nameWidth, run, options.gpu, ok ? "OK" : "FAILED");
             total.add(run);
             passed += ok ? 1 : 0;
         }
 
         if (files.size() > 1) {
             const std::string verdict = std::to_string(passed) + "/" + std::to_string(files.size()) + " OK";
-            printRatioRow("total", nameWidth, total, verdict.c_str());
+            printRatioRow("total", nameWidth, total, options.gpu, verdict.c_str());
         }
 
         return passed == files.size() ? kExitOk : kExitError;

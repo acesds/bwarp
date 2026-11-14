@@ -11,9 +11,10 @@ What exists so far:
 - The build: clang-cl or MSVC for the C++ sources, nvcc for the GPU variant.
 - sadcs's GPU BWT construction and its BWT checker, BWT path only (see [From sadcs](#from-sadcs)).
 - Format v0 ([docs/format.md](docs/format.md)) with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
+- The GPU decoder, byte for byte the same as the CPU one, valid input or not.
 - The command line and a selftest.
 
-Next: ratio tuning on the CPU reference, then the GPU decoder and encoder, then the GPU inverse BWT.
+Next: the GPU encoder, then the GPU inverse BWT.
 
 ## Command line
 
@@ -23,7 +24,7 @@ bwarp bwt <in> <out.bwt>
 bwarp check <in> <in.bwt>
 bwarp test <in|dir> [--recursive]
 bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]
-bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--recursive]
+bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--gpu [--verbose]] [--recursive]
 bwarp selftest [--verbose]
 ```
 
@@ -34,8 +35,8 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block, the same as `
 - `check`: verify a BWT file against its text by inverting it on the CPU (sequential, about 12 MB/s on enwik8).
 - `test`: build and check in memory, with the GPU's phases and memory. On a directory it runs every file in it (`--recursive` to include subdirectories), one row per file plus a total.
 - `bench`: time the GPU build, the best of `--runs` (default 5) after a warmup, with each phase. `--context` reuses one GPU context per file, `--pinned` uses page-locked host buffers. `--context --pinned` measures the way libcubwt's benchmark does.
-- `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use.
-- `selftest`: the checker on known BWTs and planted errors, and codec round trips over several parameter sets and the rejection of truncated input, and the GPU construction on adversarial inputs, verified by the checker (GPU cases skipped without a device).
+- `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use. `--gpu` also decodes on the GPU, checks the result and prints its speed without transfers (the faster of two runs) and that of the stream kernel alone; `--verbose` adds each phase.
+- `selftest`: the checker on known BWTs and planted errors, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker (GPU cases skipped without a device).
 
 ## From sadcs
 
@@ -81,8 +82,8 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 
 ## Where things live
 
-- `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead.
-- `src/codec/`: the format (`format.h`, shared by CPU and GPU) and the CPU reference codec.
+- `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead. `decode.cuh` holds the decoder kernels.
+- `src/codec/`: the format (`format.h`), table coding (`table.h`) and container (`container.h`), shared by CPU and GPU, and the CPU reference codec.
 - `src/common/`: the BWT checker and file I/O.
 - `src/cli/`: the command line and the selftest.
 - `docs/`: the design records, starting with [handoff.md](docs/handoff.md), and the [format](docs/format.md).

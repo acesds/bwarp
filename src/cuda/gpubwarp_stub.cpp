@@ -47,3 +47,13 @@ GpuStatus gpuBwt(const uint8_t*, int32_t, uint8_t*, int32_t& primary, GpuBwtStat
 
     return GpuStatus::Unavailable;
 }
+
+GpuStatus gpuDecode(const uint8_t*, size_t, std::vector<uint8_t>&, int32_t& primary, GpuDecodeStats* stats) {
+    primary = -1;
+
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}

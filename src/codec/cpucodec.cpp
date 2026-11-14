@@ -12,89 +12,19 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include "container.h"
 #include "format.h"
+#include "table.h"
 
 using namespace bwarp;
 
 namespace {
-    constexpr uint32_t kMaxLengthCodes = 32;
-
-    static_assert(lengthCode(laneBytes(1u << kMaxLogSlice)).code < kMaxLengthCodes);
-    static_assert(lengthExtraBits(lengthCode(laneBytes(1u << kMaxLogSlice)).code) <= kProbBits,
-        "a run's extra bits must fit one rANS op");
-
-    struct Layout {
-        uint32_t n;
-        int logSegment;
-        int logSlice;
-        uint32_t segments;
-        uint32_t slices;
-        uint32_t slicesPerSegment;
-
-        Layout(uint32_t n, int logSegment, int logSlice)
-            : n(n),
-              logSegment(logSegment),
-              logSlice(logSlice),
-              segments(static_cast<uint32_t>((uint64_t(n) + (uint64_t(1) << logSegment) - 1) >> logSegment)),
-              slices(static_cast<uint32_t>((uint64_t(n) + (uint64_t(1) << logSlice) - 1) >> logSlice)),
-              slicesPerSegment(1u << (logSegment - logSlice)) {}
-
-        uint32_t sliceBegin(uint32_t s) const {
-            return s << logSlice;
-        }
-
-        uint32_t sliceEnd(uint32_t s) const {
-            return static_cast<uint32_t>(std::min<uint64_t>(uint64_t(s + 1) << logSlice, n));
-        }
-
-        uint32_t firstSlice(uint32_t segment) const {
-            return segment * slicesPerSegment;
-        }
-
-        uint32_t endSlice(uint32_t segment) const {
-            return std::min(slices, (segment + 1) * slicesPerSegment);
-        }
-
-        size_t indexBytes() const {
-            return kHeaderBytes + (size_t(segments) + 1 + slices + 1) * 8;
-        }
-    };
-
-    bool validParams(int logSegment, int logSlice, int contexts) {
-        return logSlice >= kMinLogSlice && logSlice <= kMaxLogSlice && logSegment >= logSlice &&
-               logSegment <= kMaxLogSegment && contexts >= 1 && contexts <= kMaxContexts;
-    }
-
-    void put32(uint8_t* p, uint32_t v) {
-        for (int i = 0; i < 4; i++) {
-            p[i] = static_cast<uint8_t>(v >> (8 * i));
-        }
-    }
-
-    void put64(uint8_t* p, uint64_t v) {
-        for (int i = 0; i < 8; i++) {
-            p[i] = static_cast<uint8_t>(v >> (8 * i));
-        }
-    }
-
-    uint32_t get32(const uint8_t* p) {
-        return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
-    }
-
-    uint64_t get64(const uint8_t* p) {
-        return uint64_t(get32(p)) | uint64_t(get32(p + 4)) << 32;
-    }
-
-    struct Probability {
-        uint32_t p = kProbScale / 2;
-    };
-
     // Records the table's decisions, then encodes them backwards with rANS: the final state, then the words.
     class TableWriter {
      public:
         uint32_t bit(Probability& prob, uint32_t b) {
             push(b, prob.p);
-            prob.p = adaptProbability(prob.p, b);
+            prob.p = static_cast<uint16_t>(adaptProbability(prob.p, b));
             return b;
         }
 
@@ -144,96 +74,6 @@ namespace {
         std::vector<Op> m_ops;
     };
 
-    class TableReader {
-     public:
-        TableReader(const uint8_t* begin, const uint8_t* end) : m_w(end), m_end(end) {
-            if (end - begin >= 4 && (end - begin) % 2 == 0) {
-                m_x = get32(begin);
-                m_w = begin + 4;
-                m_ok = m_x >= kRansLow;
-            }
-        }
-
-        uint32_t bit(Probability& prob, uint32_t) {
-            const uint32_t b = decide(prob.p);
-            prob.p = adaptProbability(prob.p, b);
-            return b;
-        }
-
-        uint32_t raw(uint32_t, int bits) {
-            uint32_t v = 0;
-
-            for (int i = 0; i < bits; i++) {
-                v = v << 1 | decide(kProbScale / 2);
-            }
-
-            return v;
-        }
-
-        bool finished() const {
-            return m_ok && m_w == m_end && m_x == kRansLow;
-        }
-
-     private:
-        uint32_t decide(uint32_t p) {
-            const uint32_t b = (m_x & (kProbScale - 1)) >= p;
-
-            m_x = b ? ransDecodeAdvance(m_x, kProbScale - p, p) : ransDecodeAdvance(m_x, p, 0);
-
-            if (m_x < kRansLow) {
-                if (m_w == m_end) {
-                    m_ok = false;
-                    m_x = kRansLow;
-                } else {
-                    m_x = m_x << 16 | uint32_t(m_w[0]) | uint32_t(m_w[1]) << 8;
-                    m_w += 2;
-                }
-            }
-
-            return b;
-        }
-
-        const uint8_t* m_w;
-        const uint8_t* m_end;
-        uint32_t m_x = kRansLow;
-        bool m_ok = false;
-    };
-
-    constexpr uint32_t kMaxUintBits = 16;
-
-    struct UintModels {
-        Probability length[kMaxUintBits];
-        Probability top[kMaxUintBits];
-    };
-
-    // Exp-Golomb on v + 1: its bit length in unary, then the bits below the top one. v < 2^15 - 1.
-    template <class Coder>
-    uint32_t codeUint(Coder& coder, UintModels& models, uint32_t v) {
-        const uint32_t u = v + 1, bits = floorLog2(u);
-        uint32_t k = 0;
-
-        while (k < kMaxUintBits - 1 && coder.bit(models.length[k], k < bits)) {
-            k++;
-        }
-
-        uint32_t r = 1;
-
-        for (uint32_t i = k; i-- > 0;) {
-            const uint32_t b = (u >> i) & 1;
-            r = r << 1 | (i == k - 1 ? coder.bit(models.top[k], b) : coder.raw(b, 1));
-        }
-
-        return r - 1;
-    }
-
-    uint32_t zigzag(int32_t v) {
-        return v >= 0 ? 2 * static_cast<uint32_t>(v) : 2 * static_cast<uint32_t>(-v) - 1;
-    }
-
-    int32_t unzigzag(uint32_t u) {
-        return u & 1 ? -static_cast<int32_t>((u + 1) / 2) : static_cast<int32_t>(u / 2);
-    }
-
     struct Run {
         uint8_t byte;
         bool laneStart;
@@ -260,47 +100,21 @@ namespace {
         laneEnd = begin + std::min(uint32_t(j + 1) * lb, size);
     }
 
-    // A segment's table. The q arrays hold quantized counts; both sides derive the ranks and frequencies from them.
-    struct Model {
-        uint32_t contexts = 1;
-        uint32_t mantissa = 2;
-        uint32_t lengthCodes = 0;
-        uint16_t byteQ[256] = {};  // tokens per byte
-        uint16_t lengthCodeQ[kMaxLengthCodes] = {};  // tokens per length code
-        uint32_t alphabet = 0;
-        uint8_t symbols[256] = {};  // in rank order
-        uint8_t rankOf[256] = {};
-        bool symbolUsed[kMaxContexts] = {};
-        bool lengthUsed[kMaxContexts] = {};
-        uint16_t symbolQ[kMaxContexts][256] = {};  // by rank
-        uint16_t lengthQ[kMaxContexts][kMaxLengthCodes] = {};
-        uint32_t symbolCount[kMaxContexts][256] = {};  // reconstructed from q
-        uint32_t lengthCount[kMaxContexts][kMaxLengthCodes] = {};
+    // A table, with the frequencies both sides derive from it.
+    struct Model : TableData {
         uint32_t symbolFreq[kMaxContexts][256] = {};
         uint32_t symbolCum[kMaxContexts][257] = {};
-        uint32_t lengthFreq[kMaxContexts][kMaxLengthCodes] = {};
-        uint32_t lengthCum[kMaxContexts][kMaxLengthCodes + 1] = {};
+        uint32_t lengthFreq[kMaxLengthContexts][kMaxLengthCodes] = {};
+        uint32_t lengthCum[kMaxLengthContexts][kMaxLengthCodes + 1] = {};
     };
 
-    // Ranks by quantized token count, descending, ties by byte.
-    void rankSymbols(Model& model) {
-        model.alphabet = 0;
+    void toFrequencies(const uint16_t* q, uint32_t size, uint32_t mantissa, uint32_t* freq, uint32_t* cum) {
+        uint32_t counts[256];
 
-        for (uint32_t b = 0; b < 256; b++) {
-            if (model.byteQ[b] > 0) {
-                model.symbols[model.alphabet++] = static_cast<uint8_t>(b);
-            }
+        for (uint32_t i = 0; i < size; i++) {
+            counts[i] = dequantizeCount(q[i], mantissa);
         }
 
-        std::stable_sort(model.symbols, model.symbols + model.alphabet,
-            [&](uint8_t a, uint8_t b) { return model.byteQ[a] > model.byteQ[b]; });
-
-        for (uint32_t r = 0; r < model.alphabet; r++) {
-            model.rankOf[model.symbols[r]] = static_cast<uint8_t>(r);
-        }
-    }
-
-    void toFrequencies(const uint32_t* counts, uint32_t size, uint32_t* freq, uint32_t* cum) {
         normalizeFrequencies(counts, size, freq);
         cum[0] = 0;
 
@@ -312,166 +126,15 @@ namespace {
     void finishModel(Model& model) {
         for (uint32_t c = 0; c < model.contexts; c++) {
             if (model.symbolUsed[c]) {
-                toFrequencies(model.symbolCount[c], model.alphabet, model.symbolFreq[c], model.symbolCum[c]);
+                toFrequencies(model.symbolQ[c], model.alphabet, model.mantissa, model.symbolFreq[c], model.symbolCum[c]);
             }
+        }
 
+        for (uint32_t c = 0; c < lengthContexts(model.contexts); c++) {
             if (model.lengthUsed[c]) {
-                toFrequencies(model.lengthCount[c], model.lengthCodes, model.lengthFreq[c], model.lengthCum[c]);
+                toFrequencies(model.lengthQ[c], model.lengthCodes, model.mantissa, model.lengthFreq[c], model.lengthCum[c]);
             }
         }
-    }
-
-    constexpr uint32_t kZeroContexts = 32;
-    constexpr uint32_t kResidualContexts = 6;
-
-    struct MarginalModels {
-        Probability nonzero[2];  // by whether the previous entry was zero
-        UintModels value;
-    };
-
-    struct RowModels {
-        Probability used;
-        Probability nonzero[kZeroContexts];  // by predicted q
-        UintModels residual[kResidualContexts];  // by predicted q's bit length
-    };
-
-    struct TableModels {
-        MarginalModels marginal[2];  // bytes, length codes
-        RowModels rows[2];  // symbols, lengths
-    };
-
-    // Each q as the difference from the previous nonzero one.
-    template <class Coder>
-    bool codeMarginal(Coder& coder, MarginalModels& models, uint16_t* q, uint32_t size, uint32_t maxQ) {
-        int32_t previous = 0;
-        uint32_t previousZero = 1;
-
-        for (uint32_t i = 0; i < size; i++) {
-            if (!coder.bit(models.nonzero[previousZero], q[i] != 0)) {
-                q[i] = 0;
-                previousZero = 1;
-                continue;
-            }
-
-            const int32_t value = previous + unzigzag(codeUint(coder, models.value, zigzag(int32_t(q[i]) - previous)));
-
-            if (value < 1 || value > static_cast<int32_t>(maxQ)) {
-                return false;
-            }
-
-            q[i] = static_cast<uint16_t>(value);
-            previous = value;
-            previousZero = 0;
-        }
-
-        return true;
-    }
-
-    // One context's q, each relative to the prediction total * weights[i] / denominator. Entry skip cannot occur.
-    template <class Coder>
-    bool codeRow(Coder& coder, RowModels& models, bool& used, uint16_t* q, uint32_t* counts, uint32_t size,
-        uint32_t skip, const uint64_t* weights, uint64_t total, uint64_t denominator, uint32_t mantissa, uint32_t maxQ) {
-        used = coder.bit(models.used, used) != 0;
-        std::fill(counts, counts + size, 0u);
-
-        if (!used) {
-            std::fill(q, q + size, uint16_t(0));
-            return true;
-        }
-
-        bool any = false;
-
-        for (uint32_t i = 0; i < size; i++) {
-            if (i == skip) {
-                q[i] = 0;
-                continue;
-            }
-
-            const uint64_t predicted = denominator > 0 ? (total * weights[i] + denominator / 2) / denominator : 0;
-            const uint32_t pq =
-                quantizeCount(static_cast<uint32_t>(std::min<uint64_t>(predicted, 1u << kMaxLogSegment)), mantissa);
-
-            if (!coder.bit(models.nonzero[std::min(pq, kZeroContexts - 1)], q[i] != 0)) {
-                q[i] = 0;
-                continue;
-            }
-
-            const int32_t base = static_cast<int32_t>(std::max(pq, 1u));
-            UintModels& residual = models.residual[std::min(floorLog2(pq + 1), kResidualContexts - 1)];
-            const int32_t value = base + unzigzag(codeUint(coder, residual, zigzag(int32_t(q[i]) - base)));
-
-            if (value < 1 || value > static_cast<int32_t>(maxQ)) {
-                return false;
-            }
-
-            q[i] = static_cast<uint16_t>(value);
-            counts[i] = dequantizeCount(q[i], mantissa);
-            any = true;
-        }
-
-        return any;
-    }
-
-    // The table: K, the count precision, the tokens per byte and per length code, then each context's counts
-    // predicted from these as if symbol and context were independent. A symbol never follows itself in a lane.
-    template <class Coder>
-    bool codeTable(Coder& coder, Model& model, TableModels& models) {
-        model.contexts = coder.raw(model.contexts - 1, 4) + 1;
-        model.mantissa = coder.raw(model.mantissa, 2);
-
-        const uint32_t maxQ = quantizeCount(1u << kMaxLogSegment, model.mantissa);
-        if (!codeMarginal(coder, models.marginal[0], model.byteQ, 256, maxQ) ||
-            !codeMarginal(coder, models.marginal[1], model.lengthCodeQ, model.lengthCodes, maxQ)) {
-            return false;
-        }
-
-        rankSymbols(model);
-
-        if (model.alphabet == 0) {
-            return false;
-        }
-
-        const uint32_t k = model.contexts;
-        uint64_t rankCount[256] = {}, lengthCount[kMaxLengthCodes] = {}, tokens = 0, lengthTokens = 0;
-
-        for (uint32_t r = 0; r < model.alphabet; r++) {
-            rankCount[r] = dequantizeCount(model.byteQ[model.symbols[r]], model.mantissa);
-            tokens += rankCount[r];
-        }
-
-        for (uint32_t l = 0; l < model.lengthCodes; l++) {
-            lengthCount[l] = dequantizeCount(model.lengthCodeQ[l], model.mantissa);
-            lengthTokens += lengthCount[l];
-        }
-
-        // Tokens whose own symbol, or whose predecessor's, falls into context c.
-        uint64_t contextTokens[kMaxContexts] = {}, lengthContextTokens[kMaxContexts] = {};
-
-        for (uint32_t r = 0; r < model.alphabet; r++) {
-            contextTokens[contextOf(r, k)] += rankCount[r];
-            lengthContextTokens[contextOf(r, lengthContexts(k))] += rankCount[r];
-        }
-
-        RowModels* const rows = models.rows;
-
-        for (uint32_t c = 0; c < k; c++) {
-            const bool own = c < k - 1;
-
-            if (!codeRow(coder, rows[0], model.symbolUsed[c], model.symbolQ[c], model.symbolCount[c], model.alphabet,
-                    own ? c : 256, rankCount, contextTokens[c], own ? tokens - rankCount[c] : tokens, model.mantissa,
-                    maxQ)) {
-                return false;
-            }
-        }
-
-        for (uint32_t c = 0; c < lengthContexts(k); c++) {
-            if (!codeRow(coder, rows[1], model.lengthUsed[c], model.lengthQ[c], model.lengthCount[c], model.lengthCodes,
-                    kMaxLengthCodes, lengthCount, lengthContextTokens[c], lengthTokens, model.mantissa, maxQ)) {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     void buildModel(const std::vector<Run>& runs, uint32_t contexts, uint32_t mantissa, uint32_t lengthCodes,
@@ -493,7 +156,7 @@ namespace {
         rankSymbols(model);
 
         auto symbolCounts = std::make_unique<uint32_t[]>(kMaxContexts * 256);
-        auto lengthCounts = std::make_unique<uint32_t[]>(kMaxContexts * kMaxLengthCodes);
+        auto lengthCounts = std::make_unique<uint32_t[]>(kMaxLengthContexts * kMaxLengthCodes);
         uint32_t lengthTotal[kMaxLengthCodes] = {};
         uint32_t previous = 0;
 
@@ -517,7 +180,9 @@ namespace {
                 model.symbolQ[c][i] = static_cast<uint16_t>(quantizeCount(symbolCounts[c * 256 + i], mantissa));
                 model.symbolUsed[c] = model.symbolUsed[c] || model.symbolQ[c][i] > 0;
             }
+        }
 
+        for (uint32_t c = 0; c < lengthContexts(contexts); c++) {
             for (uint32_t l = 0; l < lengthCodes; l++) {
                 model.lengthQ[c][l] = static_cast<uint16_t>(quantizeCount(lengthCounts[c * kMaxLengthCodes + l], mantissa));
                 model.lengthUsed[c] = model.lengthUsed[c] || model.lengthQ[c][l] > 0;
@@ -530,7 +195,8 @@ namespace {
         TableWriter writer;
 
         auto models = std::make_unique<TableModels>();
-        codeTable(writer, model, *models);
+        Predictor predictor;
+        codeTable(writer, model, *models, predictor);
         writer.finish(out);
         finishModel(model);
     }
@@ -600,7 +266,9 @@ namespace {
 
         auto models = std::make_unique<TableModels>();
 
-        if (!codeTable(reader, model, *models) || !reader.finished()) {
+        Predictor predictor;
+
+        if (!codeTable(reader, model, *models, predictor) || !reader.finished()) {
             return false;
         }
 
@@ -700,14 +368,16 @@ namespace {
     // Slot -> index tables of one model, for decoding.
     struct SlotTables {
         uint8_t symbol[kMaxContexts][kProbScale];
-        uint8_t length[kMaxContexts][kProbScale];
+        uint8_t length[kMaxLengthContexts][kProbScale];
 
         explicit SlotTables(const Model& model) {
             for (uint32_t c = 0; c < model.contexts; c++) {
                 for (uint32_t i = 0; model.symbolUsed[c] && i < model.alphabet; i++) {
                     std::fill(symbol[c] + model.symbolCum[c][i], symbol[c] + model.symbolCum[c][i + 1], uint8_t(i));
                 }
+            }
 
+            for (uint32_t c = 0; c < lengthContexts(model.contexts); c++) {
                 for (uint32_t i = 0; model.lengthUsed[c] && i < model.lengthCodes; i++) {
                     std::fill(length[c] + model.lengthCum[c][i], length[c] + model.lengthCum[c][i + 1], uint8_t(i));
                 }
@@ -897,48 +567,21 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const EncodeParam
 }
 
 bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary) {
-    if (size < kHeaderBytes || get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt) {
+    Container container;
+
+    if (!readContainer(data, size, container)) {
         return false;
     }
 
-    const int logSegment = data[6], logSlice = data[7];
-    const uint32_t n = get32(data + 8);
-
-    if (!validParams(logSegment, logSlice, 1) || n > INT32_MAX) {
-        return false;
-    }
-
-    const Layout layout(n, logSegment, logSlice);
-
-    if (size < layout.indexBytes()) {
-        return false;
-    }
-
-    std::vector<uint64_t> segmentOffsets(layout.segments + 1), sliceOffsets(layout.slices + 1);
-    const uint8_t* index = data + kHeaderBytes;
-
-    for (uint64_t& offset : segmentOffsets) {
-        offset = get64(index);
-        index += 8;
-    }
-
-    for (uint64_t& offset : sliceOffsets) {
-        offset = get64(index);
-        index += 8;
-    }
-
-    if (segmentOffsets.front() != layout.indexBytes() || segmentOffsets.back() != sliceOffsets.front() ||
-        sliceOffsets.back() != size || !std::is_sorted(segmentOffsets.begin(), segmentOffsets.end()) ||
-        !std::is_sorted(sliceOffsets.begin(), sliceOffsets.end())) {
-        return false;
-    }
-
-    const uint32_t lengthCodes = lengthCodeCount(logSlice);
+    const Layout& layout = container.layout;
+    const std::vector<uint64_t>& segmentOffsets = container.segmentOffsets;
+    const std::vector<uint64_t>& sliceOffsets = container.sliceOffsets;
+    const uint32_t lengthCodes = lengthCodeCount(layout.logSlice);
     auto model = std::make_unique<Model>();
     std::unique_ptr<SlotTables> slots;
 
-    bwt.assign(n, 0);
-    primary = static_cast<int32_t>(get32(data + 12));
+    bwt.assign(layout.n, 0);
+    primary = container.primary;
 
     for (uint32_t g = 0; g < layout.segments; g++) {
         *model = Model{};

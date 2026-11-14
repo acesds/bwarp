@@ -11,12 +11,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 enum class GpuStatus {
     Ok,
     Unavailable,
     NotEnoughMemory,
-    Failed,  // see gpuLastError()
+    Invalid,  // malformed input
+    Failed,   // see gpuLastError()
 };
 
 struct GpuDevice {
@@ -77,3 +79,19 @@ void gpuDestroyBwtContext(GpuBwtContext* context);
 // The BWT of text plus a sentinel, without the sentinel; primary is the sentinel's row. bwt may be text.
 GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats = nullptr);
 GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats = nullptr);
+
+// ---- Decoding ----------------------------------------------------------------------------------
+
+struct GpuDecodeStats {
+    int64_t deviceBytes = 0;
+    double setupSeconds = 0.0;   // allocating
+    double uploadSeconds = 0.0;
+    double tableSeconds = 0.0;   // decoding the tables
+    double finishSeconds = 0.0;  // their frequencies and slot tables
+    double streamSeconds = 0.0;
+    double downloadSeconds = 0.0;
+};
+
+// Decodes bwarp data, with the same result as decodeBwt().
+GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
+    GpuDecodeStats* stats = nullptr);

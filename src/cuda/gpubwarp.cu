@@ -19,6 +19,8 @@
 #include <new>
 #include <cuda_runtime.h>
 #include "classsort.cuh"
+#include "container.h"
+#include "decode.cuh"
 #include "devicecommon.cuh"
 #include "merge.cuh"
 #include "samplerank.cuh"
@@ -579,4 +581,164 @@ void gpuFreePinned(void* pointer) {
     if (pointer) {
         cudaFreeHost(pointer);
     }
+}
+
+// ---- Decoding ----------------------------------------------------------------------------------
+
+namespace {
+    template <class T>
+    class DeviceArray {
+     public:
+        DeviceArray() = default;
+        DeviceArray(const DeviceArray&) = delete;
+        DeviceArray& operator=(const DeviceArray&) = delete;
+
+        ~DeviceArray() {
+            if (m_pointer) {
+                cudaFree(m_pointer);
+            }
+        }
+
+        cudaError_t allocate(size_t count, int64_t& total) {
+            m_bytes = std::max<size_t>(count, 1) * sizeof(T);
+            total += static_cast<int64_t>(m_bytes);
+            return cudaMalloc(&m_pointer, m_bytes);
+        }
+
+        T* get() const {
+            return m_pointer;
+        }
+
+        size_t bytes() const {
+            return m_bytes;
+        }
+
+     private:
+        T* m_pointer = nullptr;
+        size_t m_bytes = 0;
+    };
+
+    GpuStatus invalid(const char* what) {
+        snprintf(lastError, sizeof lastError, "malformed input: %s", what);
+        return GpuStatus::Invalid;
+    }
+
+    cudaError_t readError(const uint32_t* device, uint32_t& error) {
+        return cudaMemcpy(&error, device, sizeof error, cudaMemcpyDeviceToHost);
+    }
+}
+
+GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
+    GpuDecodeStats* stats) {
+    using namespace bwarp;
+
+    lastError[0] = '\0';
+
+    GpuDecodeStats local;
+    GpuDecodeStats& s = stats ? *stats : local;
+
+    s = GpuDecodeStats{};
+    primary = -1;
+
+    Container container;
+
+    if (!readContainer(data, size, container)) {
+        return invalid("header or index");
+    }
+
+    const Layout& layout = container.layout;
+
+    bwt.resize(layout.n);
+
+    if (layout.n == 0) {
+        primary = container.primary;
+        return GpuStatus::Ok;
+    }
+
+    cudaError_t error;
+    auto start = std::chrono::steady_clock::now();
+    DeviceArray<uint8_t> deviceData, deviceBwt;
+    DeviceArray<uint64_t> segmentOffsets, sliceOffsets;
+    DeviceArray<TableData> tables;
+    DeviceArray<gpu::DeviceTable> deviceTables;
+    DeviceArray<uint32_t> deviceError;
+
+    if ((error = deviceData.allocate(size, s.deviceBytes)) != cudaSuccess ||
+        (error = deviceBwt.allocate(layout.n, s.deviceBytes)) != cudaSuccess ||
+        (error = segmentOffsets.allocate(layout.segments + 1, s.deviceBytes)) != cudaSuccess ||
+        (error = sliceOffsets.allocate(layout.slices + 1, s.deviceBytes)) != cudaSuccess ||
+        (error = tables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = deviceTables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = deviceError.allocate(1, s.deviceBytes)) != cudaSuccess) {
+        return failed("cudaMalloc", error);
+    }
+
+    s.setupSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    if ((error = cudaMemcpy(deviceData.get(), data, size, cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemcpy(segmentOffsets.get(), container.segmentOffsets.data(), segmentOffsets.bytes(),
+             cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemcpy(sliceOffsets.get(), container.sliceOffsets.data(), sliceOffsets.bytes(),
+             cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemset(tables.get(), 0, tables.bytes())) != cudaSuccess ||
+        (error = cudaMemset(deviceError.get(), 0, deviceError.bytes())) != cudaSuccess ||
+        (error = cudaDeviceSynchronize()) != cudaSuccess) {
+        return failed("upload", error);
+    }
+
+    s.uploadSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    // The stream decoder trusts the tables, so they are checked first.
+    uint32_t decodeError = 0;
+
+    gpu::decodeTables<<<(layout.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(deviceData.get(),
+        segmentOffsets.get(), layout.segments, lengthCodeCount(layout.logSlice), tables.get(), deviceError.get());
+
+    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
+        (error = readError(deviceError.get(), decodeError)) != cudaSuccess) {
+        return failed("table decoding", error);
+    }
+
+    if (decodeError != 0) {
+        return invalid("table");
+    }
+
+    s.tableSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    gpu::finishTables<<<layout.segments, 256>>>(tables.get(), deviceTables.get());
+
+    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+        return failed("table finishing", error);
+    }
+
+    s.finishSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    gpu::decodeSlices<<<(layout.slices + gpu::kSliceWarps - 1) / gpu::kSliceWarps, gpu::kSliceWarps * 32>>>(
+        deviceData.get(), sliceOffsets.get(), layout.slices, layout.n, layout.logSegment, layout.logSlice,
+        deviceTables.get(), deviceBwt.get(), deviceError.get());
+
+    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
+        (error = readError(deviceError.get(), decodeError)) != cudaSuccess) {
+        return failed("stream decoding", error);
+    }
+
+    if (decodeError != 0) {
+        return invalid("stream");
+    }
+
+    s.streamSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    if ((error = cudaMemcpy(bwt.data(), deviceBwt.get(), layout.n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+        return failed("download", error);
+    }
+
+    s.downloadSeconds = secondsSince(start);
+    primary = container.primary;
+
+    return GpuStatus::Ok;
 }
