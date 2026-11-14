@@ -100,12 +100,14 @@ namespace {
         laneEnd = begin + std::min(uint32_t(j + 1) * lb, size);
     }
 
-    // A table, with the frequencies both sides derive from it.
+    // A table, with the frequencies both sides derive from it and, when encoding, the counts it quantizes.
     struct Model : TableData {
         uint32_t symbolFreq[kMaxContexts][256] = {};
         uint32_t symbolCum[kMaxContexts][257] = {};
         uint32_t lengthFreq[kMaxLengthContexts][kMaxLengthCodes] = {};
         uint32_t lengthCum[kMaxLengthContexts][kMaxLengthCodes + 1] = {};
+        uint32_t symbolCount[kMaxContexts][256] = {};  // by rank
+        uint32_t lengthCount[kMaxLengthContexts][kMaxLengthCodes] = {};
     };
 
     void toFrequencies(const uint16_t* q, uint32_t size, uint32_t mantissa, uint32_t* freq, uint32_t* cum) {
@@ -155,8 +157,6 @@ namespace {
 
         rankSymbols(model);
 
-        auto symbolCounts = std::make_unique<uint32_t[]>(kMaxContexts * 256);
-        auto lengthCounts = std::make_unique<uint32_t[]>(kMaxLengthContexts * kMaxLengthCodes);
         uint32_t lengthTotal[kMaxLengthCodes] = {};
         uint32_t previous = 0;
 
@@ -165,8 +165,8 @@ namespace {
             const uint32_t context = run.laneStart ? contexts - 1 : contextOf(previous, contexts);
             const uint32_t code = lengthCode(run.length).code;
 
-            symbolCounts[context * 256 + rank]++;
-            lengthCounts[contextOf(rank, lengthContexts(contexts)) * kMaxLengthCodes + code]++;
+            model.symbolCount[context][rank]++;
+            model.lengthCount[contextOf(rank, lengthContexts(contexts))][code]++;
             lengthTotal[code]++;
             previous = rank;
         }
@@ -177,14 +177,14 @@ namespace {
 
         for (uint32_t c = 0; c < contexts; c++) {
             for (uint32_t i = 0; i < model.alphabet; i++) {
-                model.symbolQ[c][i] = static_cast<uint16_t>(quantizeCount(symbolCounts[c * 256 + i], mantissa));
+                model.symbolQ[c][i] = static_cast<uint16_t>(quantizeCount(model.symbolCount[c][i], mantissa));
                 model.symbolUsed[c] = model.symbolUsed[c] || model.symbolQ[c][i] > 0;
             }
         }
 
         for (uint32_t c = 0; c < lengthContexts(contexts); c++) {
             for (uint32_t l = 0; l < lengthCodes; l++) {
-                model.lengthQ[c][l] = static_cast<uint16_t>(quantizeCount(lengthCounts[c * kMaxLengthCodes + l], mantissa));
+                model.lengthQ[c][l] = static_cast<uint16_t>(quantizeCount(model.lengthCount[c][l], mantissa));
                 model.lengthUsed[c] = model.lengthUsed[c] || model.lengthQ[c][l] > 0;
             }
         }
@@ -201,62 +201,57 @@ namespace {
         finishModel(model);
     }
 
-    // The bits the runs' symbols and length codes take with the model.
-    double streamBits(const Model& model, const std::vector<Run>& runs) {
-        static const auto cost = [] {
-            std::vector<double> c(kProbScale + 1);
+    // What the model's table and the segment's symbols and length codes cost, in 1/kCostScale bits.
+    uint64_t modelCost(Model& model) {
+        const uint32_t* cost = encodingCosts();
+        CostCoder coder(cost);
+        auto models = std::make_unique<TableModels>();
+        Predictor predictor;
 
-            for (uint32_t f = 1; f <= kProbScale; f++) {
-                c[f] = kProbBits - std::log2(double(f));
+        codeTable(coder, model, *models, predictor);
+        finishModel(model);
+
+        uint64_t bits = coder.bits();
+
+        for (uint32_t c = 0; c < model.contexts; c++) {
+            for (uint32_t i = 0; i < model.alphabet; i++) {
+                bits += uint64_t(model.symbolCount[c][i]) * cost[model.symbolFreq[c][i]];
             }
+        }
 
-            return c;
-        }();
-
-        const uint32_t k = model.contexts;
-        uint32_t previous = 0;
-        double bits = 0;
-
-        for (const Run& run : runs) {
-            const uint32_t rank = model.rankOf[run.byte];
-            const uint32_t context = run.laneStart ? k - 1 : contextOf(previous, k);
-
-            bits += cost[model.symbolFreq[context][rank]];
-            bits += cost[model.lengthFreq[contextOf(rank, lengthContexts(k))][lengthCode(run.length).code]];
-            previous = rank;
+        for (uint32_t c = 0; c < lengthContexts(model.contexts); c++) {
+            for (uint32_t l = 0; l < model.lengthCodes; l++) {
+                bits += uint64_t(model.lengthCount[c][l]) * cost[model.lengthFreq[c][l]];
+            }
         }
 
         return bits;
     }
 
     // Writes the segment's table for the context count up to maxContexts and the count precision that minimize
-    // the table and stream bits together.
+    // the table's and the stream's estimated bits together, the first of equals.
     void chooseModel(const std::vector<Run>& runs, uint32_t maxContexts, uint32_t lengthCodes, Model& best,
         std::vector<uint8_t>& out) {
         constexpr uint32_t kContextCounts[] = {1, 2, 4, 8, 16};
         constexpr uint32_t kMantissas = 2;  // finer counts did not pay on Silesia
         auto model = std::make_unique<Model>();
-        std::vector<uint8_t> table, bestTable;
-        double bestBits = 0;
+        uint64_t bestBits = UINT64_MAX;
 
         for (const uint32_t contexts : kContextCounts) {
             for (uint32_t mantissa = 0; contexts <= maxContexts && mantissa < kMantissas; mantissa++) {
                 *model = Model{};
                 buildModel(runs, contexts, mantissa, lengthCodes, *model);
-                table.clear();
-                writeModel(*model, table);
 
-                const double bits = 8.0 * table.size() + streamBits(*model, runs);
+                const uint64_t bits = modelCost(*model);
 
-                if (bestTable.empty() || bits < bestBits) {
+                if (bits < bestBits) {
                     best = *model;
-                    bestTable.swap(table);
                     bestBits = bits;
                 }
             }
         }
 
-        out.insert(out.end(), bestTable.begin(), bestTable.end());
+        writeModel(best, out);
     }
 
     bool readModel(const uint8_t* begin, const uint8_t* end, uint32_t lengthCodes, Model& model) {
@@ -493,6 +488,20 @@ namespace {
     }
 }
 
+const uint32_t* encodingCosts() {
+    static const auto table = [] {
+        std::vector<uint32_t> cost(kProbScale + 1, 0);
+
+        for (uint32_t f = 1; f <= kProbScale; f++) {
+            cost[f] = static_cast<uint32_t>(std::lround((kProbBits - std::log2(double(f))) * kCostScale));
+        }
+
+        return cost;
+    }();
+
+    return table.data();
+}
+
 int chooseLogSample(uint32_t n, uint64_t codedBytes, int recordedLogSample) {
     using namespace bwarp;
 
@@ -508,13 +517,8 @@ int chooseLogSample(uint32_t n, uint64_t codedBytes, int recordedLogSample) {
     return k;
 }
 
-bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
-    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats) {
-    EncodeStats local;
-    EncodeStats& s = stats ? *stats : local;
-
-    s = EncodeStats{};
-
+bool validEncodeInput(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params) {
     if (n < 0 || !validParams(params.logSegment, params.logSlice, params.contexts, kMaxLogSample) ||
         recordedLogSample < kMinLogSample || recordedLogSample > kMaxLogSample ||
         (params.logSample != 0 && (params.logSample < recordedLogSample || params.logSample > kMaxLogSample)) ||
@@ -526,6 +530,63 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* s
         if (!validRow(samples[j], static_cast<uint32_t>(n))) {
             return false;
         }
+    }
+
+    return true;
+}
+
+void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample, const EncodeParams& params,
+    const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets, std::vector<uint8_t>& out,
+    EncodeStats& s) {
+    const uint64_t bodyBytes = sliceOffsets.back();
+    const int logSample = params.logSample != 0
+                              ? params.logSample
+                              : chooseLogSample(static_cast<uint32_t>(n), bodyBytes, recordedLogSample);
+    const Layout layout(static_cast<uint32_t>(n), params.logSegment, params.logSlice, logSample);
+
+    out.assign(layout.indexBytes(), 0);
+    put32(&out[0], kMagic);
+    out[4] = kVersion;
+    out[5] = kTransformBwt;
+    out[6] = static_cast<uint8_t>(params.logSegment);
+    out[7] = static_cast<uint8_t>(params.logSlice);
+    out[8] = static_cast<uint8_t>(logSample);
+    put32(&out[12], layout.n);
+    put32(&out[16], static_cast<uint32_t>(primary));
+
+    // Position j * 2^logSample is recorded sample j * 2^(logSample - recorded) - 1.
+    for (uint32_t j = 0; j < layout.samples; j++) {
+        const uint64_t recorded = (uint64_t(j + 1) << (logSample - recordedLogSample)) - 1;
+        put32(&out[layout.samplesAt() + 4 * size_t(j)], samples[recorded]);
+    }
+
+    uint8_t* index = &out[layout.offsetsAt()];
+
+    for (const uint64_t offset : segmentOffsets) {
+        put64(index, layout.indexBytes() + offset);
+        index += 8;
+    }
+
+    for (const uint64_t offset : sliceOffsets) {
+        put64(index, layout.indexBytes() + offset);
+        index += 8;
+    }
+
+    s.logSample = logSample;
+    s.indexBytes = static_cast<int64_t>(layout.indexBytes());
+    s.tableBytes = static_cast<int64_t>(segmentOffsets.back() - segmentOffsets.front());
+    s.streamBytes = static_cast<int64_t>(sliceOffsets.back() - sliceOffsets.front());
+}
+
+bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats) {
+    EncodeStats local;
+    EncodeStats& s = stats ? *stats : local;
+
+    s = EncodeStats{};
+
+    if (!validEncodeInput(n, primary, samples, recordedLogSample, params)) {
+        return false;
     }
 
     // The tables and streams first, at offsets relative to their start, as the samples kept depend on their size.
@@ -564,44 +625,11 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* s
 
     sliceOffsets[coding.slices] = body.size();
 
-    const int logSample =
-        params.logSample != 0 ? params.logSample : chooseLogSample(coding.n, body.size(), recordedLogSample);
-    const Layout layout(coding.n, params.logSegment, params.logSlice, logSample);
+    const int64_t tokens = s.tokens;
 
-    out.assign(layout.indexBytes(), 0);
-    put32(&out[0], kMagic);
-    out[4] = kVersion;
-    out[5] = kTransformBwt;
-    out[6] = static_cast<uint8_t>(params.logSegment);
-    out[7] = static_cast<uint8_t>(params.logSlice);
-    out[8] = static_cast<uint8_t>(logSample);
-    put32(&out[12], layout.n);
-    put32(&out[16], static_cast<uint32_t>(primary));
-
-    // Position j * 2^logSample is recorded sample j * 2^(logSample - recorded) - 1.
-    for (uint32_t j = 0; j < layout.samples; j++) {
-        const uint64_t recorded = (uint64_t(j + 1) << (logSample - recordedLogSample)) - 1;
-        put32(&out[layout.samplesAt() + 4 * size_t(j)], samples[recorded]);
-    }
-
-    uint8_t* index = &out[layout.offsetsAt()];
-
-    for (const uint64_t offset : segmentOffsets) {
-        put64(index, layout.indexBytes() + offset);
-        index += 8;
-    }
-
-    for (const uint64_t offset : sliceOffsets) {
-        put64(index, layout.indexBytes() + offset);
-        index += 8;
-    }
-
+    writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, s);
     out.insert(out.end(), body.begin(), body.end());
-
-    s.logSample = logSample;
-    s.indexBytes = static_cast<int64_t>(layout.indexBytes());
-    s.tableBytes = static_cast<int64_t>(segmentOffsets[coding.segments] - segmentOffsets[0]);
-    s.streamBytes = static_cast<int64_t>(sliceOffsets[coding.slices] - sliceOffsets[0]);
+    s.tokens = tokens;
 
     return true;
 }

@@ -30,6 +30,10 @@ constexpr uint64_t kAutoSampleShare = 128;
 
 int chooseLogSample(uint32_t n, uint64_t codedBytes, int recordedLogSample);
 
+// -log2(f / 2^11) for f in [1, 2^11], in 1/256 bits (entry 0 unused): what the encoders weigh tables by, the CPU
+// and the GPU one alike.
+const uint32_t* encodingCosts();
+
 struct EncodeStats {
     int64_t indexBytes = 0;  // header, samples and offsets
     int64_t tableBytes = 0;
@@ -43,6 +47,15 @@ struct EncodeStats {
 // rows are out of range.
 bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
     const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats = nullptr);
+
+// For other encoders: whether encodeBwt() accepts the input, and the header, samples and offsets it writes before
+// the tables and streams, given their offsets relative to the first table (the last slice offset is their size).
+// Sets s's logSample, indexBytes, tableBytes and streamBytes.
+bool validEncodeInput(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params);
+void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample, const EncodeParams& params,
+    const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets, std::vector<uint8_t>& out,
+    EncodeStats& s);
 
 // False on malformed input.
 bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,

@@ -21,6 +21,7 @@
 #include "classsort.cuh"
 #include "container.h"
 #include "decode.cuh"
+#include "encode.cuh"
 #include "inverse.cuh"
 #include "devicecommon.cuh"
 #include "merge.cuh"
@@ -720,7 +721,7 @@ namespace {
         s.tableSeconds = secondsSince(start);
         start = std::chrono::steady_clock::now();
 
-        gpu::finishTables<<<layout.segments, 256>>>(d.tables.get(), d.deviceTables.get());
+        gpu::finishTables<<<layout.segments, 256>>>(d.tables.get(), d.deviceTables.get(), true);
 
         if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
             return failed("table finishing", error);
@@ -874,6 +875,186 @@ GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& 
     text.resize(n);
 
     if (n > 0 && (error = cudaMemcpy(text.data(), deviceText.get(), n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+        return failed("download", error);
+    }
+
+    s.downloadSeconds = secondsSince(start);
+
+    return GpuStatus::Ok;
+}
+
+// ---- Encoding ----------------------------------------------------------------------------------
+
+GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats, GpuEncodeStats* stats) {
+    using namespace bwarp;
+
+    lastError[0] = '\0';
+
+    GpuEncodeStats local;
+    GpuEncodeStats& s = stats ? *stats : local;
+    EncodeStats localEncode;
+    EncodeStats& e = encodeStats ? *encodeStats : localEncode;
+
+    s = GpuEncodeStats{};
+    e = EncodeStats{};
+
+    if (!validEncodeInput(n, primary, samples, recordedLogSample, params)) {
+        snprintf(lastError, sizeof lastError, "invalid encoding parameters or rows");
+        return GpuStatus::Invalid;
+    }
+
+    const Layout coding(static_cast<uint32_t>(n), params.logSegment, params.logSlice, kMaxLogSample);
+    std::vector<uint64_t> segmentOffsets(coding.segments + 1, 0), sliceOffsets(coding.slices + 1, 0);
+
+    if (n == 0) {
+        writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
+        return GpuStatus::Ok;
+    }
+
+    cudaError_t error;
+    auto start = std::chrono::steady_clock::now();
+    DeviceArray<uint8_t> deviceBwt, deviceOut;
+    DeviceArray<uint32_t> cost, ops, wordCounts, states, sliceWords;
+    DeviceArray<uint16_t> words;
+    DeviceArray<uint64_t> decisions, opOffsets, deviceSegmentOffsets, deviceSliceOffsets;
+    DeviceArray<unsigned long long> tokens;
+    DeviceArray<TableData> tables;
+    DeviceArray<gpu::DeviceTable> codes;
+    DeviceArray<uint8_t> temp;
+    size_t scanBytes = 0;
+
+    if ((error = cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, decisions.get(), opOffsets.get(),
+             coding.segments + 1)) != cudaSuccess ||
+        (error = deviceBwt.allocate(size_t(n) + 16, s.deviceBytes)) != cudaSuccess ||
+        (error = cost.allocate(kProbScale + 1, s.deviceBytes)) != cudaSuccess ||
+        (error = decisions.allocate(coding.segments + 1, s.deviceBytes)) != cudaSuccess ||
+        (error = opOffsets.allocate(coding.segments + 1, s.deviceBytes)) != cudaSuccess ||
+        (error = temp.allocate(scanBytes, s.deviceBytes)) != cudaSuccess ||
+        (error = tables.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = codes.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = wordCounts.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = states.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
+        (error = sliceWords.allocate(coding.slices, s.deviceBytes)) != cudaSuccess ||
+        (error = tokens.allocate(1, s.deviceBytes)) != cudaSuccess) {
+        return failed("cudaMalloc", error);
+    }
+
+    s.setupSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    if ((error = cudaMemcpy(deviceBwt.get(), bwt, size_t(n), cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemcpy(cost.get(), encodingCosts(), cost.bytes(), cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemset(decisions.get(), 0, decisions.bytes())) != cudaSuccess ||
+        (error = cudaMemset(tokens.get(), 0, tokens.bytes())) != cudaSuccess ||
+        (error = cudaDeviceSynchronize()) != cudaSuccess) {
+        return failed("upload", error);
+    }
+
+    s.uploadSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    gpu::chooseTables<<<coding.segments, gpu::kChooseThreads>>>(deviceBwt.get(), coding.n, coding.logSegment,
+        coding.logSlice, static_cast<uint32_t>(params.contexts), cost.get(), tables.get(), decisions.get());
+
+    uint64_t totalOps = 0;
+
+    if ((error = cudaGetLastError()) != cudaSuccess ||
+        (error = cub::DeviceScan::ExclusiveSum(temp.get(), scanBytes, decisions.get(), opOffsets.get(),
+             coding.segments + 1)) != cudaSuccess ||
+        (error = cudaMemcpy(&totalOps, opOffsets.get() + coding.segments, sizeof totalOps, cudaMemcpyDeviceToHost)) !=
+            cudaSuccess) {
+        return failed("choosing tables", error);
+    }
+
+    s.chooseSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    if ((error = ops.allocate(totalOps, s.deviceBytes)) != cudaSuccess ||
+        (error = words.allocate(totalOps, s.deviceBytes)) != cudaSuccess) {
+        return failed("cudaMalloc", error);
+    }
+
+    gpu::encodeTables<<<(coding.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(
+        tables.get(), coding.segments, opOffsets.get(), ops.get(), words.get(), wordCounts.get(), states.get());
+    gpu::finishTables<<<coding.segments, 256>>>(tables.get(), codes.get(), false);
+
+    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+        return failed("coding tables", error);
+    }
+
+    s.tableSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    const uint32_t sliceBlocks = (coding.slices + gpu::kEncodeWarps - 1) / gpu::kEncodeWarps;
+    std::vector<uint32_t> tableWords(coding.segments), streamWords(coding.slices);
+    unsigned long long tokenCount = 0;
+
+    gpu::encodeSlices<false><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt.get(), coding.n, coding.slices,
+        coding.logSegment, coding.logSlice, tables.get(), codes.get(), sliceWords.get(), nullptr, nullptr, tokens.get());
+
+    if ((error = cudaGetLastError()) != cudaSuccess ||
+        (error = cudaMemcpy(tableWords.data(), wordCounts.get(), tableWords.size() * 4, cudaMemcpyDeviceToHost)) !=
+            cudaSuccess ||
+        (error = cudaMemcpy(streamWords.data(), sliceWords.get(), streamWords.size() * 4, cudaMemcpyDeviceToHost)) !=
+            cudaSuccess ||
+        (error = cudaMemcpy(&tokenCount, tokens.get(), sizeof tokenCount, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+        return failed("sizing streams", error);
+    }
+
+    s.sizeSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    for (uint32_t g = 0; g < coding.segments; g++) {
+        segmentOffsets[g + 1] = segmentOffsets[g] + 4 + 2 * uint64_t(tableWords[g]);
+    }
+
+    sliceOffsets[0] = segmentOffsets[coding.segments];
+
+    for (uint32_t sl = 0; sl < coding.slices; sl++) {
+        sliceOffsets[sl + 1] = sliceOffsets[sl] + kLanes * 4 + 2 * uint64_t(streamWords[sl]);
+    }
+
+    writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
+    e.tokens = static_cast<int64_t>(tokenCount);
+
+    const size_t indexBytes = out.size();
+
+    for (uint64_t& offset : segmentOffsets) {
+        offset += indexBytes;
+    }
+
+    for (uint64_t& offset : sliceOffsets) {
+        offset += indexBytes;
+    }
+
+    out.resize(sliceOffsets.back());
+
+    if ((error = deviceOut.allocate(out.size(), s.deviceBytes)) != cudaSuccess ||
+        (error = deviceSegmentOffsets.allocate(segmentOffsets.size(), s.deviceBytes)) != cudaSuccess ||
+        (error = deviceSliceOffsets.allocate(sliceOffsets.size(), s.deviceBytes)) != cudaSuccess ||
+        (error = cudaMemcpy(deviceSegmentOffsets.get(), segmentOffsets.data(), deviceSegmentOffsets.bytes(),
+             cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (error = cudaMemcpy(deviceSliceOffsets.get(), sliceOffsets.data(), deviceSliceOffsets.bytes(),
+             cudaMemcpyHostToDevice)) != cudaSuccess) {
+        return failed("placing", error);
+    }
+
+    gpu::placeTables<<<coding.segments, 256>>>(words.get(), opOffsets.get(), wordCounts.get(), states.get(),
+        deviceSegmentOffsets.get(), deviceOut.get());
+    gpu::encodeSlices<true><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt.get(), coding.n, coding.slices,
+        coding.logSegment, coding.logSlice, tables.get(), codes.get(), sliceWords.get(), deviceSliceOffsets.get(),
+        deviceOut.get(), nullptr);
+
+    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+        return failed("encoding streams", error);
+    }
+
+    s.streamSeconds = secondsSince(start);
+    start = std::chrono::steady_clock::now();
+
+    if ((error = cudaMemcpy(out.data() + indexBytes, deviceOut.get() + indexBytes, out.size() - indexBytes,
+             cudaMemcpyDeviceToHost)) != cudaSuccess) {
         return failed("download", error);
     }
 

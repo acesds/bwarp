@@ -192,8 +192,8 @@ namespace bwarp::gpu {
         return low;
     }
 
-    // A block per segment.
-    __global__ void finishTables(const TableData* tables, DeviceTable* out) {
+    // A block per segment. The slot tables only with slots, for decoding.
+    __global__ void finishTables(const TableData* tables, DeviceTable* out, bool slots) {
         const TableData& table = tables[blockIdx.x];
         DeviceTable& device = out[blockIdx.x];
         const uint32_t k = table.contexts, kl = lengthContexts(k);
@@ -228,7 +228,7 @@ namespace bwarp::gpu {
 
         __syncthreads();
 
-        for (uint32_t c = 0; c < k + kl; c++) {
+        for (uint32_t c = 0; slots && c < k + kl; c++) {
             const bool symbol = c < k;
             const uint32_t row = symbol ? c : c - k;
 

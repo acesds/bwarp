@@ -95,9 +95,9 @@ namespace {
             "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use;\n"
             "--sample (10 to 31; default automatic, see chooseLogSample()): an inverse BWT chain per\n"
             "2^LOG2 bytes.\n"
-            "--gpu also decompresses on the GPU, checks the text, and prints its speed without\n"
-            "transfers (the faster of two runs), that of the stream kernel and that of the inverse\n"
-            "BWT; --verbose adds the phases.\n");
+            "--gpu also encodes on the GPU and decompresses there, checks both, and prints their\n"
+            "speeds without transfers (the faster of two runs), that of the stream decoder and that\n"
+            "of the inverse BWT; --verbose adds the phases.\n");
     }
 
     bool parseOptions(int argc, char** argv, Options& options) {
@@ -601,7 +601,8 @@ namespace {
         int64_t compressed = 0;
         double encodeSeconds = 0.0;
         double decodeSeconds = 0.0;
-        double gpuSeconds = 0.0;  // the decompressor's device phases
+        double gpuEncodeSeconds = 0.0;  // the encoder's device phases
+        double gpuSeconds = 0.0;        // the decompressor's
         double gpuStreamSeconds = 0.0;
         double gpuInverseSeconds = 0.0;
 
@@ -614,6 +615,7 @@ namespace {
             compressed += other.compressed;
             encodeSeconds += other.encodeSeconds;
             decodeSeconds += other.decodeSeconds;
+            gpuEncodeSeconds += other.gpuEncodeSeconds;
             gpuSeconds += other.gpuSeconds;
             gpuStreamSeconds += other.gpuStreamSeconds;
             gpuInverseSeconds += other.gpuInverseSeconds;
@@ -631,7 +633,8 @@ namespace {
             megabytesPerSecond(run.bytes, run.decodeSeconds));
 
         if (gpu) {
-            printf(" %8.1f %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuSeconds),
+            printf(" %8.1f %8.1f %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuEncodeSeconds),
+                megabytesPerSecond(run.bytes, run.gpuSeconds),
                 megabytesPerSecond(run.bytes, run.gpuStreamSeconds), megabytesPerSecond(run.bytes, run.gpuInverseSeconds));
         }
 
@@ -660,7 +663,7 @@ namespace {
             params.contexts, sampling.c_str());
         printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s", nameWidth, "file", "bytes", "compressed", "bpc", "runs/n",
             "tab%", "idx%", "enc MB/s", "dec MB/s");
-        printf(options.gpu ? " %8s %8s %8s\n" : "\n", "gpu MB/s", "str MB/s", "inv MB/s");
+        printf(options.gpu ? " %8s %8s %8s %8s\n" : "\n", "genc MB/s", "gdec MB/s", "str MB/s", "inv MB/s");
 
         RatioRun total;
         size_t passed = 0;
@@ -711,6 +714,34 @@ namespace {
 
             // The faster of two runs, the first one warming up.
             for (int r = 0; options.gpu && ok && r < 2; r++) {
+                std::vector<uint8_t> gpuEncoded;
+                GpuEncodeStats stats;
+                const GpuStatus status = gpuEncode(bwt.data(), n, primary, samples.data(), kAutoMinLogSample, params,
+                    gpuEncoded, nullptr, &stats);
+
+                if (!reportGpu(status)) {
+                    ok = false;
+                    break;
+                }
+
+                ok = gpuEncoded == encoded;
+
+                const double device = stats.chooseSeconds + stats.tableSeconds + stats.sizeSeconds + stats.streamSeconds;
+
+                if (r == 0 || device < run.gpuEncodeSeconds) {
+                    run.gpuEncodeSeconds = device;
+                }
+
+                if (options.verbose && r == 1) {
+                    printf("  GPU encoder: upload %.2f ms, choosing %.2f ms, tables %.2f ms, sizing %.2f ms, streams "
+                           "%.2f ms, download %.2f ms, %lld MiB\n",
+                        1e3 * stats.uploadSeconds, 1e3 * stats.chooseSeconds, 1e3 * stats.tableSeconds,
+                        1e3 * stats.sizeSeconds, 1e3 * stats.streamSeconds, 1e3 * stats.downloadSeconds,
+                        static_cast<long long>(stats.deviceBytes >> 20));
+                }
+            }
+
+            for (int r = 0; options.gpu && ok && r < 2; r++) {
                 GpuDecodeStats stats;
                 const GpuStatus status = gpuDecompress(encoded.data(), encoded.size(), decoded, &stats);
 
@@ -731,7 +762,7 @@ namespace {
                 }
 
                 if (options.verbose && r == 1) {
-                    printf("  GPU: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, LF %.2f ms, "
+                    printf("  GPU decompressor: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, LF %.2f ms, "
                            "chains %.2f ms, download %.2f ms, %lld MiB\n",
                         1e3 * stats.uploadSeconds, 1e3 * stats.tableSeconds, 1e3 * stats.finishSeconds,
                         1e3 * stats.streamSeconds, 1e3 * stats.rankSeconds, 1e3 * stats.chainSeconds,

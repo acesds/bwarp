@@ -226,6 +226,14 @@ namespace {
             return;
         }
 
+        if (std::vector<uint8_t> gpuEncoded;
+            gpu && (gpuEncode(input.data(), n, inputPrimary, samples.data(), bwarp::kMinLogSample, params,
+                        gpuEncoded) != GpuStatus::Ok ||
+                       gpuEncoded != encoded)) {
+            suite.reportFailure(label, "GPU encoder differs", -1);
+            return;
+        }
+
         // Every truncation must be refused.
         suite.cases++;
 
@@ -328,6 +336,14 @@ namespace {
 
         if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, params, encoded)) {
             suite.reportFailure(name + " GPU round trip", "encoder refused", -1);
+            return;
+        }
+
+        if (std::vector<uint8_t> gpuEncoded;
+            gpuEncode(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, params, gpuEncoded) !=
+                GpuStatus::Ok ||
+            gpuEncoded != encoded) {
+            suite.reportFailure(name + " GPU round trip", "GPU encoder differs", -1);
             return;
         }
 

@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "cpucodec.h"
 
 enum class GpuStatus {
     Ok,
@@ -104,3 +105,21 @@ GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt,
 
 // Decodes bwarp data and inverts the BWT on the device: the original text.
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats = nullptr);
+
+// ---- Encoding ----------------------------------------------------------------------------------
+
+struct GpuEncodeStats {
+    int64_t deviceBytes = 0;
+    double setupSeconds = 0.0;     // allocating
+    double uploadSeconds = 0.0;
+    double chooseSeconds = 0.0;    // choosing the tables
+    double tableSeconds = 0.0;     // coding them
+    double sizeSeconds = 0.0;      // sizing the streams
+    double streamSeconds = 0.0;    // placing the tables and encoding the streams
+    double downloadSeconds = 0.0;
+};
+
+// Encodes as encodeBwt() does, byte for byte. Invalid where encodeBwt() returns false.
+GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats = nullptr,
+    GpuEncodeStats* stats = nullptr);

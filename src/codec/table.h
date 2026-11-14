@@ -74,6 +74,40 @@ namespace bwarp {
         bool m_ok = false;
     };
 
+    // Sums what a table's decisions cost, in 1/kCostScale bits, from a table of -log2(f / kProbScale) by f.
+    constexpr uint32_t kCostScale = 256;
+
+    class CostCoder {
+     public:
+        BWARP_HOST_DEVICE explicit CostCoder(const uint32_t* cost) : m_cost(cost) {}
+
+        BWARP_HOST_DEVICE uint32_t bit(Probability& prob, uint32_t b) {
+            m_bits += m_cost[b ? kProbScale - prob.p : prob.p];
+            m_decisions++;
+            prob.p = static_cast<uint16_t>(adaptProbability(prob.p, b));
+            return b;
+        }
+
+        BWARP_HOST_DEVICE uint32_t raw(uint32_t v, int bits) {
+            m_bits += uint64_t(bits) * m_cost[kProbScale / 2];
+            m_decisions += static_cast<uint32_t>(bits);
+            return v;
+        }
+
+        BWARP_HOST_DEVICE uint64_t bits() const {
+            return m_bits;
+        }
+
+        BWARP_HOST_DEVICE uint32_t decisions() const {
+            return m_decisions;
+        }
+
+     private:
+        const uint32_t* m_cost;
+        uint64_t m_bits = 0;
+        uint32_t m_decisions = 0;
+    };
+
     constexpr uint32_t kMaxUintBits = 16;
 
     struct UintModels {
@@ -300,6 +334,14 @@ namespace bwarp {
         }
     }
 
+    // q of round(total * weight / denominator), at most 2^24.
+    BWARP_HD uint32_t predictCount(uint64_t total, uint64_t weight, uint64_t denominator, uint32_t mantissa) {
+        uint64_t predicted = denominator > 0 ? (total * weight + denominator / 2) / denominator : 0;
+        predicted = predicted < (1u << kMaxLogSegment) ? predicted : (1u << kMaxLogSegment);
+
+        return quantizeCount(static_cast<uint32_t>(predicted), mantissa);
+    }
+
     // The predicted q of entry i in symbol context c, or in length context c.
     BWARP_HOST_DEVICE inline uint32_t predictQ(const TableData& table, const Predictor& p, bool symbol, uint32_t c,
         uint32_t i) {
@@ -315,10 +357,7 @@ namespace bwarp {
             denominator = p.lengthTokens;
         }
 
-        uint64_t predicted = denominator > 0 ? (total * weight + denominator / 2) / denominator : 0;
-        predicted = predicted < (1u << kMaxLogSegment) ? predicted : (1u << kMaxLogSegment);
-
-        return quantizeCount(static_cast<uint32_t>(predicted), table.mantissa);
+        return predictCount(total, weight, denominator, table.mantissa);
     }
 
     // The rows, after codeCounts() and rankSymbols(): each context's counts relative to predicted(symbol, c, i).
