@@ -38,25 +38,30 @@ namespace bwarp {
         }
     }
 
-    inline bool validParams(int logSegment, int logSlice, int contexts) {
+    inline bool validParams(int logSegment, int logSlice, int contexts, int logSample) {
         return logSlice >= kMinLogSlice && logSlice <= kMaxLogSlice && logSegment >= logSlice &&
-               logSegment <= kMaxLogSegment && contexts >= 1 && contexts <= kMaxContexts;
+               logSegment <= kMaxLogSegment && contexts >= 1 && contexts <= kMaxContexts &&
+               logSample >= kMinLogSample && logSample <= kMaxLogSample;
     }
 
     struct Layout {
         uint32_t n = 0;
         int logSegment = 0;
         int logSlice = 0;
+        int logSample = 0;
+        uint32_t samples = 0;
         uint32_t segments = 0;
         uint32_t slices = 0;
         uint32_t slicesPerSegment = 0;
 
         Layout() = default;
 
-        Layout(uint32_t n, int logSegment, int logSlice)
+        Layout(uint32_t n, int logSegment, int logSlice, int logSample)
             : n(n),
               logSegment(logSegment),
               logSlice(logSlice),
+              logSample(logSample),
+              samples(sampleCount(n, logSample)),
               segments(static_cast<uint32_t>((uint64_t(n) + (uint64_t(1) << logSegment) - 1) >> logSegment)),
               slices(static_cast<uint32_t>((uint64_t(n) + (uint64_t(1) << logSlice) - 1) >> logSlice)),
               slicesPerSegment(1u << (logSegment - logSlice)) {}
@@ -77,43 +82,68 @@ namespace bwarp {
             return std::min(slices, (segment + 1) * slicesPerSegment);
         }
 
+        size_t samplesAt() const {
+            return kHeaderBytes;
+        }
+
+        size_t offsetsAt() const {
+            return kHeaderBytes + size_t(samples) * 4;
+        }
+
         size_t indexBytes() const {
-            return kHeaderBytes + (size_t(segments) + 1 + slices + 1) * 8;
+            return offsetsAt() + (size_t(segments) + 1 + slices + 1) * 8;
         }
     };
 
     struct Container {
         Layout layout;
         int32_t primary = 0;
+        std::vector<uint32_t> samples;
         std::vector<uint64_t> segmentOffsets;  // tables, then the end of the last
         std::vector<uint64_t> sliceOffsets;    // streams, then the end of the last
     };
 
-    // False unless the header is valid and the offsets ascend over exactly the rest of the data.
+    // Rows of the n + 1 sorted rotations: the sentinel's is 0, so the others are in [1, n].
+    inline bool validRow(uint32_t row, uint32_t n) {
+        return n == 0 ? row == 0 : row >= 1 && row <= n;
+    }
+
+    // False unless the header is valid, the rows in range and the offsets ascend over exactly the rest of the data.
     inline bool readContainer(const uint8_t* data, size_t size, Container& container) {
-        if (size < kHeaderBytes || get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt) {
+        if (size < kHeaderBytes || get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt ||
+            data[9] != 0 || data[10] != 0 || data[11] != 0) {
             return false;
         }
 
-        const int logSegment = data[6], logSlice = data[7];
-        const uint32_t n = get32(data + 8);
+        const int logSegment = data[6], logSlice = data[7], logSample = data[8];
+        const uint32_t n = get32(data + 12), primary = get32(data + 16);
 
-        if (!validParams(logSegment, logSlice, 1) || n > INT32_MAX) {
+        if (!validParams(logSegment, logSlice, 1, logSample) || n > INT32_MAX || !validRow(primary, n)) {
             return false;
         }
 
-        const Layout layout(n, logSegment, logSlice);
+        const Layout layout(n, logSegment, logSlice, logSample);
 
         if (size < layout.indexBytes()) {
             return false;
         }
 
         container.layout = layout;
-        container.primary = static_cast<int32_t>(get32(data + 12));
+        container.primary = static_cast<int32_t>(primary);
+        container.samples.resize(layout.samples);
         container.segmentOffsets.resize(layout.segments + 1);
         container.sliceOffsets.resize(layout.slices + 1);
 
-        const uint8_t* index = data + kHeaderBytes;
+        const uint8_t* index = data + layout.samplesAt();
+
+        for (uint32_t& sample : container.samples) {
+            sample = get32(index);
+            index += 4;
+
+            if (!validRow(sample, n)) {
+                return false;
+            }
+        }
 
         for (uint64_t& offset : container.segmentOffsets) {
             offset = get64(index);

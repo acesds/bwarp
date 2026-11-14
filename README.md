@@ -12,9 +12,10 @@ What exists so far:
 - sadcs's GPU BWT construction and its BWT checker, BWT path only (see [From sadcs](#from-sadcs)).
 - Format v0 ([docs/format.md](docs/format.md)) with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
 - The GPU decoder, byte for byte the same as the CPU one, valid input or not.
+- The GPU inverse BWT, so decompression runs entirely on the device: psi from a stable radix sort of the BWT, then one chain per sampled row that the construction records.
 - The command line and a selftest.
 
-Next: the GPU encoder, then the GPU inverse BWT.
+Next: the GPU encoder.
 
 ## Command line
 
@@ -24,7 +25,7 @@ bwarp bwt <in> <out.bwt>
 bwarp check <in> <in.bwt>
 bwarp test <in|dir> [--recursive]
 bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]
-bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--gpu [--verbose]] [--recursive]
+bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--gpu [--verbose]] [--recursive]
 bwarp selftest [--verbose]
 ```
 
@@ -35,14 +36,14 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block, the same as `
 - `check`: verify a BWT file against its text by inverting it on the CPU (sequential, about 12 MB/s on enwik8).
 - `test`: build and check in memory, with the GPU's phases and memory. On a directory it runs every file in it (`--recursive` to include subdirectories), one row per file plus a total.
 - `bench`: time the GPU build, the best of `--runs` (default 5) after a warmup, with each phase. `--context` reuses one GPU context per file, `--pinned` uses page-locked host buffers. `--context --pinned` measures the way libcubwt's benchmark does.
-- `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use. `--gpu` also decodes on the GPU, checks the result and prints its speed without transfers (the faster of two runs) and that of the stream kernel alone; `--verbose` adds each phase.
-- `selftest`: the checker on known BWTs and planted errors, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker (GPU cases skipped without a device).
+- `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use, `--sample` (default automatic, 10 to 31) an inverse BWT chain per 2^LOG2 bytes. `--gpu` also decompresses on the GPU, checks the text and prints its speed without transfers (the faster of two runs), that of the stream kernel and that of the inverse BWT; `--verbose` adds each phase.
+- `selftest`: the checker on known BWTs and planted errors, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder and decompressor must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker and then compressed and decompressed on the GPU (GPU cases skipped without a device).
 
 ## From sadcs
 
 bwarp needs only sadcs's BWT, so it takes only that path:
 
-- `src/cuda/samplerank.cuh`, `classsort.cuh`, `merge.cuh`, `devicecommon.cuh`, `differencecover.h`: the GPU construction. The merge writes only the BWT (and the splitter indices it needs internally), not the suffix array. Only the cover modulo 32 is kept.
+- `src/cuda/samplerank.cuh`, `classsort.cuh`, `merge.cuh`, `devicecommon.cuh`, `differencecover.h`: the GPU construction. The merge writes only the BWT (and the splitter indices it needs internally), not the suffix array, plus the rows of sampled text positions for the inverse. Only the cover modulo 32 is kept.
 - `src/cuda/gpubwarp.cu`: sadcs's host driver (staging, contexts, memory planning), with `gpuBwt()` only. No `gpuSuffixArray()` and no `gpuRankSample()`.
 - `src/common/checker.*`: `checkBwt()` only, none of the suffix array checks.
 
@@ -82,7 +83,7 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 
 ## Where things live
 
-- `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead. `decode.cuh` holds the decoder kernels.
+- `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead. `decode.cuh` holds the decoder kernels, `inverse.cuh` the inverse BWT.
 - `src/codec/`: the format (`format.h`), table coding (`table.h`) and container (`container.h`), shared by CPU and GPU, and the CPU reference codec.
 - `src/common/`: the BWT checker and file I/O.
 - `src/cli/`: the command line and the selftest.

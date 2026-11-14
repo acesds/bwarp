@@ -17,6 +17,7 @@
 #include <vector>
 #include "checker.h"
 #include "cpucodec.h"
+#include "format.h"
 #include "gpubwarp.h"
 
 namespace {
@@ -162,37 +163,60 @@ namespace {
 
     // ---- codec ---------------------------------------------------------------------------------
 
-    // The GPU decoder must accept exactly what the CPU decoder accepts, with the same result.
+    // The GPU decoder must accept exactly what the CPU decoder accepts, with the same result, and so must the
+    // GPU decompressor, whose output must have the same size.
     bool sameAsCpu(const std::vector<uint8_t>& encoded, size_t size) {
-        std::vector<uint8_t> cpu, gpu;
+        std::vector<uint8_t> cpu, gpu, text;
         int32_t cpuPrimary = -1, gpuPrimary = -1;
         const bool cpuOk = decodeBwt(encoded.data(), size, cpu, cpuPrimary);
         const GpuStatus status = gpuDecode(encoded.data(), size, gpu, gpuPrimary);
+        const GpuStatus inverseStatus = gpuDecompress(encoded.data(), size, text);
 
-        if (status != GpuStatus::Ok && status != GpuStatus::Invalid) {
-            printf("  GPU decoder: %s\n", gpuLastError());
-            return false;
+        for (const GpuStatus st : {status, inverseStatus}) {
+            if (st != GpuStatus::Ok && st != GpuStatus::Invalid) {
+                printf("  GPU decoder: %s\n", gpuLastError());
+                return false;
+            }
         }
 
-        return cpuOk == (status == GpuStatus::Ok) && (!cpuOk || (cpu == gpu && cpuPrimary == gpuPrimary));
+        return cpuOk == (status == GpuStatus::Ok) && cpuOk == (inverseStatus == GpuStatus::Ok) &&
+               (!cpuOk || (cpu == gpu && cpuPrimary == gpuPrimary && text.size() == cpu.size()));
     }
 
     void testCodec(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, const EncodeParams& params,
         bool gpu) {
         const int32_t n = static_cast<int32_t>(input.size());
         const std::string label = name + " (2^" + std::to_string(params.logSegment) + ", 2^" +
-                                  std::to_string(params.logSlice) + ", " + std::to_string(params.contexts) + ")";
+                                  std::to_string(params.logSlice) + ", " + std::to_string(params.contexts) + ", 2^" +
+                                  std::to_string(params.logSample) + ")";
         std::vector<uint8_t> encoded, decoded;
+        std::vector<uint32_t> decodedSamples;
         int32_t primary = -1;
+
+        // Not a BWT, so any rows in range will do.
+        const int32_t inputPrimary = n / 2 + (n > 0 ? 1 : 0);
+        std::vector<uint32_t> samples(bwarp::sampleCount(static_cast<uint32_t>(n), bwarp::kMinLogSample));
+
+        for (size_t j = 0; j < samples.size(); j++) {
+            samples[j] = static_cast<uint32_t>((j * 7919) % static_cast<size_t>(n) + 1);
+        }
 
         suite.cases++;
 
-        if (!encodeBwt(input.data(), n, 12345, params, encoded)) {
+        if (!encodeBwt(input.data(), n, inputPrimary, samples.data(), bwarp::kMinLogSample, params, encoded)) {
             suite.reportFailure(label, "encoder refused", -1);
             return;
         }
 
-        if (!decodeBwt(encoded.data(), encoded.size(), decoded, primary) || primary != 12345 || decoded != input) {
+        bool same = decodeBwt(encoded.data(), encoded.size(), decoded, primary, &decodedSamples) &&
+                    primary == inputPrimary && decoded == input;
+        const int logSample = encoded.size() > 8 ? encoded[8] : 0;
+
+        for (size_t j = 0; same && j < decodedSamples.size(); j++) {
+            same = decodedSamples[j] == samples[((j + 1) << (logSample - bwarp::kMinLogSample)) - 1];
+        }
+
+        if (!same) {
             suite.reportFailure(label, "round trip differs", -1);
             return;
         }
@@ -219,7 +243,7 @@ namespace {
             std::vector<uint8_t> corrupt = encoded;
             corrupt[at] ^= 0x5a;
 
-            const size_t n = corrupt[8] | corrupt[9] << 8 | corrupt[10] << 16 | size_t(corrupt[11]) << 24;
+            const size_t n = corrupt[12] | corrupt[13] << 8 | corrupt[14] << 16 | size_t(corrupt[15]) << 24;
 
             if (decodeBwt(corrupt.data(), corrupt.size(), decoded, primary) && decoded.size() != n) {
                 suite.reportFailure(label + ", corrupted", "wrong size", static_cast<int64_t>(at));
@@ -238,7 +262,8 @@ namespace {
     }
 
     void runCodecCases(Suite& suite) {
-        const EncodeParams paramSets[] = {{15, 15, 16}, {20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {16, 16, 16}, {24, 12, 2}};
+        const EncodeParams paramSets[] = {{15, 15, 16, 0}, {20, 15, 8, 8}, {10, 10, 1, 31}, {12, 10, 4, 9},
+            {16, 16, 16, 16}, {24, 12, 2, 0}};
         Rng rng{5};
         std::vector<std::pair<std::string, std::vector<uint8_t>>> inputs = {
             {"\"\"", {}},
@@ -273,20 +298,47 @@ namespace {
 
     // ---- GPU -----------------------------------------------------------------------------------
 
+    // The construction, checked, then compressed and decompressed on the GPU.
     void testGpu(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, GpuBwtContext* context = nullptr) {
         const int32_t n = static_cast<int32_t>(input.size());
+        EncodeParams params;
         Bwt bwt;
+
+        params.logSample = bwarp::kMinLogSample;  // the most chains
+
+        std::vector<uint32_t> samples(bwarp::sampleCount(static_cast<uint32_t>(n), params.logSample));
 
         suite.cases++;
         bwt.bytes = input;
 
-        if (gpuBwt(context, bwt.bytes.data(), n, bwt.bytes.data(), bwt.primary) != GpuStatus::Ok) {
+        if (gpuBwt(context, bwt.bytes.data(), n, bwt.bytes.data(), bwt.primary, nullptr, samples.data(),
+                params.logSample) != GpuStatus::Ok) {
             suite.reportFailure(name + " GPU", gpuLastError(), -1);
             return;
         }
 
         if (const CheckResult result = checkBwt(input.data(), n, bwt.bytes.data(), bwt.primary); !result.ok) {
             suite.reportFailure(name + " GPU", result.reason, result.index);
+            return;
+        }
+
+        std::vector<uint8_t> encoded, text;
+
+        suite.cases++;
+
+        if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, params, encoded)) {
+            suite.reportFailure(name + " GPU round trip", "encoder refused", -1);
+            return;
+        }
+
+        if (gpuDecompress(encoded.data(), encoded.size(), text) != GpuStatus::Ok) {
+            suite.reportFailure(name + " GPU round trip", gpuLastError(), -1);
+            return;
+        }
+
+        if (text != input) {
+            const auto diff = std::mismatch(text.begin(), text.end(), input.begin(), input.end());
+            suite.reportFailure(name + " GPU round trip", "text differs", diff.first - text.begin());
             return;
         }
 

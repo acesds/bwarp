@@ -21,6 +21,7 @@
 #include "classsort.cuh"
 #include "container.h"
 #include "decode.cuh"
+#include "inverse.cuh"
 #include "devicecommon.cuh"
 #include "merge.cuh"
 #include "samplerank.cuh"
@@ -394,7 +395,8 @@ void gpuDestroyBwtContext(GpuBwtContext* context) {
 
 namespace {
     // Leaves the BWT in output as MergeOutput::Bwt describes it.
-    GpuStatus buildOnDevice(GpuBwtContext& context, gpusa::Construction& c, const uint8_t* text, int32_t n, GpuBwtStats& s, uint32_t*& lists, uint32_t*& output, gpusa::Merger& merger, uint32_t& suffixZeroRow) {
+    // With samples, also records the rows of text positions j * 2^logSample, j >= 1.
+    GpuStatus buildOnDevice(GpuBwtContext& context, gpusa::Construction& c, const uint8_t* text, int32_t n, GpuBwtStats& s, uint32_t*& lists, uint32_t*& output, gpusa::Merger& merger, uint32_t& suffixZeroRow, uint32_t* samples, int logSample) {
         using namespace gpusa;
 
         MemoryPlan plan;
@@ -438,13 +440,28 @@ namespace {
             return failed("cudaMalloc", error);
         }
 
-        const MergeInput input{c.text, c.ranks, lists, c.n, layout};
+        MergeInput input{c.text, c.ranks, lists, c.n, layout};
+        const uint32_t sampleCount = samples ? bwarp::sampleCount(static_cast<uint32_t>(n), logSample) : 0;
+
+        if (sampleCount > 0) {
+            if ((error = c.memory.allocate(input.samples, sampleCount)) != cudaSuccess) {
+                return failed("cudaMalloc", error);
+            }
+
+            input.logSample = static_cast<uint32_t>(logSample);
+        }
 
         if ((error = merger.run(input, output, MergeOutput::Bwt)) != cudaSuccess ||
             (error = cudaDeviceSynchronize()) != cudaSuccess ||
             (error = cudaMemcpy(&suffixZeroRow, merger.suffixZeroRow(), sizeof(uint32_t), cudaMemcpyDeviceToHost)) !=
-                cudaSuccess) {
+                cudaSuccess ||
+            (sampleCount > 0 && (error = cudaMemcpy(samples, input.samples, sampleCount * sizeof(uint32_t),
+                                     cudaMemcpyDeviceToHost)) != cudaSuccess)) {
             return failed("merge", error);
+        }
+
+        if (input.samples) {
+            c.memory.release(input.samples);
         }
 
         s.mergeBytes = c.memory.peak();
@@ -475,11 +492,12 @@ namespace {
     }
 }
 
-GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats) {
+GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats,
+    uint32_t* samples, int logSample) {
     using namespace gpusa;
 
     if (!context) {
-        return gpuBwt(text, n, bwt, primary, stats);
+        return gpuBwt(text, n, bwt, primary, stats, samples, logSample);
     }
 
     lastError[0] = '\0';
@@ -505,7 +523,7 @@ GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t
     uint32_t* output = nullptr;
     uint32_t row = 0;
 
-    if (const GpuStatus status = buildOnDevice(*context, c, text, n, s, lists, output, merger, row);
+    if (const GpuStatus status = buildOnDevice(*context, c, text, n, s, lists, output, merger, row, samples, logSample);
         status != GpuStatus::Ok) {
         return status;
     }
@@ -537,7 +555,8 @@ GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t
     return GpuStatus::Ok;
 }
 
-GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats) {
+GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats, uint32_t* samples,
+    int logSample) {
     lastError[0] = '\0';
 
     GpuBwtStats local;
@@ -559,7 +578,7 @@ GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary,
     }
 
     return withTemporaryContext(
-        n, s, [&](GpuBwtContext* context) { return gpuBwt(context, text, n, bwt, primary, &s); });
+        n, s, [&](GpuBwtContext* context) { return gpuBwt(context, text, n, bwt, primary, &s, samples, logSample); });
 }
 
 const char* gpuLastError() {
@@ -628,117 +647,242 @@ namespace {
     }
 }
 
+namespace {
+    struct DeviceDecode {
+        bwarp::Container container;
+        DeviceArray<uint8_t> data, bwt;  // bwt padded to a multiple of 16 bytes
+        DeviceArray<uint64_t> segmentOffsets, sliceOffsets;
+        DeviceArray<bwarp::TableData> tables;
+        DeviceArray<bwarp::gpu::DeviceTable> deviceTables;
+        DeviceArray<uint32_t> error;
+    };
+
+    // Leaves the BWT in d.bwt.
+    GpuStatus decodeOnDevice(const uint8_t* data, size_t size, DeviceDecode& d, GpuDecodeStats& s) {
+        using namespace bwarp;
+
+        if (!readContainer(data, size, d.container)) {
+            return invalid("header or index");
+        }
+
+        const Layout& layout = d.container.layout;
+
+        if (layout.n == 0) {
+            return GpuStatus::Ok;
+        }
+
+        cudaError_t error;
+        auto start = std::chrono::steady_clock::now();
+
+        if ((error = d.data.allocate(size, s.deviceBytes)) != cudaSuccess ||
+            (error = d.bwt.allocate((size_t(layout.n) + 15) & ~size_t(15), s.deviceBytes)) != cudaSuccess ||
+            (error = d.segmentOffsets.allocate(layout.segments + 1, s.deviceBytes)) != cudaSuccess ||
+            (error = d.sliceOffsets.allocate(layout.slices + 1, s.deviceBytes)) != cudaSuccess ||
+            (error = d.tables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
+            (error = d.deviceTables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
+            (error = d.error.allocate(1, s.deviceBytes)) != cudaSuccess) {
+            return failed("cudaMalloc", error);
+        }
+
+        s.setupSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        if ((error = cudaMemcpy(d.data.get(), data, size, cudaMemcpyHostToDevice)) != cudaSuccess ||
+            (error = cudaMemcpy(d.segmentOffsets.get(), d.container.segmentOffsets.data(), d.segmentOffsets.bytes(),
+                 cudaMemcpyHostToDevice)) != cudaSuccess ||
+            (error = cudaMemcpy(d.sliceOffsets.get(), d.container.sliceOffsets.data(), d.sliceOffsets.bytes(),
+                 cudaMemcpyHostToDevice)) != cudaSuccess ||
+            (error = cudaMemset(d.tables.get(), 0, d.tables.bytes())) != cudaSuccess ||
+            (error = cudaMemset(d.error.get(), 0, d.error.bytes())) != cudaSuccess ||
+            (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("upload", error);
+        }
+
+        s.uploadSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        // The stream decoder trusts the tables, so they are checked first.
+        uint32_t decodeError = 0;
+
+        gpu::decodeTables<<<(layout.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(
+            d.data.get(), d.segmentOffsets.get(), layout.segments, lengthCodeCount(layout.logSlice), d.tables.get(),
+            d.error.get());
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
+            (error = readError(d.error.get(), decodeError)) != cudaSuccess) {
+            return failed("table decoding", error);
+        }
+
+        if (decodeError != 0) {
+            return invalid("table");
+        }
+
+        s.tableSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        gpu::finishTables<<<layout.segments, 256>>>(d.tables.get(), d.deviceTables.get());
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("table finishing", error);
+        }
+
+        s.finishSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        gpu::decodeSlices<<<(layout.slices + gpu::kSliceWarps - 1) / gpu::kSliceWarps, gpu::kSliceWarps * 32>>>(
+            d.data.get(), d.sliceOffsets.get(), layout.slices, layout.n, layout.logSegment, layout.logSlice,
+            d.deviceTables.get(), d.bwt.get(), d.error.get());
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
+            (error = readError(d.error.get(), decodeError)) != cudaSuccess) {
+            return failed("stream decoding", error);
+        }
+
+        if (decodeError != 0) {
+            return invalid("stream");
+        }
+
+        s.streamSeconds = secondsSince(start);
+
+        return GpuStatus::Ok;
+    }
+
+    // The text of d.bwt into text, which holds the sort's indices first (at least 16 bytes, for the text's
+    // 16-byte stores). n > 0.
+    GpuStatus invertOnDevice(DeviceDecode& d, DeviceArray<uint32_t>& text, GpuDecodeStats& s) {
+        using namespace bwarp;
+
+        const Layout& layout = d.container.layout;
+        const uint32_t n = layout.n;
+        const uint32_t chains = layout.samples + 1;
+        const uint32_t primary = static_cast<uint32_t>(d.container.primary);
+        auto start = std::chrono::steady_clock::now();
+        cudaError_t error;
+        DeviceArray<uint8_t> sortedKeys, temp;
+        DeviceArray<uint32_t>& indices = text;
+        DeviceArray<uint32_t> psi, counts, samples;
+        size_t sortBytes = 0, histogramBytes = 0;
+
+        if ((error = cub::DeviceRadixSort::SortPairs(nullptr, sortBytes, d.bwt.get(), sortedKeys.get(), indices.get(),
+                 psi.get(), n, 0, 8)) != cudaSuccess ||
+            (error = cub::DeviceHistogram::HistogramEven(nullptr, histogramBytes, d.bwt.get(), counts.get(), 257, 0u,
+                 256u, n)) != cudaSuccess ||
+            (error = sortedKeys.allocate(n, s.deviceBytes)) != cudaSuccess ||
+            (error = indices.allocate(std::max<size_t>(n, 4), s.deviceBytes)) != cudaSuccess ||
+            (error = psi.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess ||
+            (error = counts.allocate(256, s.deviceBytes)) != cudaSuccess ||
+            (error = samples.allocate(layout.samples, s.deviceBytes)) != cudaSuccess ||
+            (error = temp.allocate(std::max(sortBytes, histogramBytes), s.deviceBytes)) != cudaSuccess ||
+            (layout.samples > 0 &&
+                (error = cudaMemcpy(samples.get(), d.container.samples.data(), size_t(layout.samples) * 4,
+                     cudaMemcpyHostToDevice)) != cudaSuccess) ||
+            (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("inverse setup", error);
+        }
+
+        s.setupSeconds += secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        const uint32_t blocks = (n + 1 + gpu::kInverseThreads - 1) / gpu::kInverseThreads;
+
+        gpu::iota<<<blocks, gpu::kInverseThreads>>>(indices.get(), n);
+
+        if ((error = cudaGetLastError()) != cudaSuccess ||
+            (error = cub::DeviceRadixSort::SortPairs(temp.get(), sortBytes, d.bwt.get(), sortedKeys.get(),
+                 indices.get(), psi.get() + 1, n, 0, 8)) != cudaSuccess ||
+            (error = cub::DeviceHistogram::HistogramEven(temp.get(), histogramBytes, d.bwt.get(), counts.get(), 257,
+                 0u, 256u, n)) != cudaSuccess) {
+            return failed("inverse sort", error);
+        }
+
+        gpu::finishPsi<<<blocks, gpu::kInverseThreads>>>(psi.get(), n, primary);
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("inverse sort", error);
+        }
+
+        s.sortSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        const uint32_t chainBlocks = (chains + gpu::kInverseThreads - 1) / gpu::kInverseThreads;
+        const uint32_t logSample = static_cast<uint32_t>(layout.logSample);
+
+        gpu::walkChains<<<chainBlocks, gpu::kInverseThreads>>>(psi.get(), counts.get(), samples.get(), primary, n,
+            logSample, chains, reinterpret_cast<uint8_t*>(text.get()));
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("inverse chains", error);
+        }
+
+        s.chainSeconds = secondsSince(start);
+
+        return GpuStatus::Ok;
+    }
+}
+
 GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
     GpuDecodeStats* stats) {
-    using namespace bwarp;
-
     lastError[0] = '\0';
 
     GpuDecodeStats local;
     GpuDecodeStats& s = stats ? *stats : local;
+    DeviceDecode d;
 
     s = GpuDecodeStats{};
     primary = -1;
 
-    Container container;
-
-    if (!readContainer(data, size, container)) {
-        return invalid("header or index");
+    if (const GpuStatus status = decodeOnDevice(data, size, d, s); status != GpuStatus::Ok) {
+        return status;
     }
 
-    const Layout& layout = container.layout;
-
-    bwt.resize(layout.n);
-
-    if (layout.n == 0) {
-        primary = container.primary;
-        return GpuStatus::Ok;
-    }
-
+    const uint32_t n = d.container.layout.n;
+    const auto start = std::chrono::steady_clock::now();
     cudaError_t error;
-    auto start = std::chrono::steady_clock::now();
-    DeviceArray<uint8_t> deviceData, deviceBwt;
-    DeviceArray<uint64_t> segmentOffsets, sliceOffsets;
-    DeviceArray<TableData> tables;
-    DeviceArray<gpu::DeviceTable> deviceTables;
-    DeviceArray<uint32_t> deviceError;
 
-    if ((error = deviceData.allocate(size, s.deviceBytes)) != cudaSuccess ||
-        (error = deviceBwt.allocate(layout.n, s.deviceBytes)) != cudaSuccess ||
-        (error = segmentOffsets.allocate(layout.segments + 1, s.deviceBytes)) != cudaSuccess ||
-        (error = sliceOffsets.allocate(layout.slices + 1, s.deviceBytes)) != cudaSuccess ||
-        (error = tables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = deviceTables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = deviceError.allocate(1, s.deviceBytes)) != cudaSuccess) {
-        return failed("cudaMalloc", error);
-    }
+    bwt.resize(n);
 
-    s.setupSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    if ((error = cudaMemcpy(deviceData.get(), data, size, cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemcpy(segmentOffsets.get(), container.segmentOffsets.data(), segmentOffsets.bytes(),
-             cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemcpy(sliceOffsets.get(), container.sliceOffsets.data(), sliceOffsets.bytes(),
-             cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemset(tables.get(), 0, tables.bytes())) != cudaSuccess ||
-        (error = cudaMemset(deviceError.get(), 0, deviceError.bytes())) != cudaSuccess ||
-        (error = cudaDeviceSynchronize()) != cudaSuccess) {
-        return failed("upload", error);
-    }
-
-    s.uploadSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    // The stream decoder trusts the tables, so they are checked first.
-    uint32_t decodeError = 0;
-
-    gpu::decodeTables<<<(layout.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(deviceData.get(),
-        segmentOffsets.get(), layout.segments, lengthCodeCount(layout.logSlice), tables.get(), deviceError.get());
-
-    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
-        (error = readError(deviceError.get(), decodeError)) != cudaSuccess) {
-        return failed("table decoding", error);
-    }
-
-    if (decodeError != 0) {
-        return invalid("table");
-    }
-
-    s.tableSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    gpu::finishTables<<<layout.segments, 256>>>(tables.get(), deviceTables.get());
-
-    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
-        return failed("table finishing", error);
-    }
-
-    s.finishSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    gpu::decodeSlices<<<(layout.slices + gpu::kSliceWarps - 1) / gpu::kSliceWarps, gpu::kSliceWarps * 32>>>(
-        deviceData.get(), sliceOffsets.get(), layout.slices, layout.n, layout.logSegment, layout.logSlice,
-        deviceTables.get(), deviceBwt.get(), deviceError.get());
-
-    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess ||
-        (error = readError(deviceError.get(), decodeError)) != cudaSuccess) {
-        return failed("stream decoding", error);
-    }
-
-    if (decodeError != 0) {
-        return invalid("stream");
-    }
-
-    s.streamSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    if ((error = cudaMemcpy(bwt.data(), deviceBwt.get(), layout.n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+    if (n > 0 && (error = cudaMemcpy(bwt.data(), d.bwt.get(), n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
         return failed("download", error);
     }
 
     s.downloadSeconds = secondsSince(start);
-    primary = container.primary;
+    primary = d.container.primary;
+
+    return GpuStatus::Ok;
+}
+
+GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats) {
+    lastError[0] = '\0';
+
+    GpuDecodeStats local;
+    GpuDecodeStats& s = stats ? *stats : local;
+    DeviceDecode d;
+    DeviceArray<uint32_t> deviceText;
+
+    s = GpuDecodeStats{};
+
+    if (const GpuStatus status = decodeOnDevice(data, size, d, s); status != GpuStatus::Ok) {
+        return status;
+    }
+
+    const uint32_t n = d.container.layout.n;
+
+    if (n > 0) {
+        if (const GpuStatus status = invertOnDevice(d, deviceText, s); status != GpuStatus::Ok) {
+            return status;
+        }
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    cudaError_t error;
+
+    text.resize(n);
+
+    if (n > 0 && (error = cudaMemcpy(text.data(), deviceText.get(), n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+        return failed("download", error);
+    }
+
+    s.downloadSeconds = secondsSince(start);
 
     return GpuStatus::Ok;
 }

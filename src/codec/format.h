@@ -25,13 +25,15 @@ namespace bwarp {
     constexpr uint32_t kMagic = 0x50525742;  // "BWRP"
     constexpr uint8_t kVersion = 0;
     constexpr uint8_t kTransformBwt = 0;
-    constexpr int kHeaderBytes = 16;
+    constexpr int kHeaderBytes = 20;
 
     constexpr int kLanes = 32;
     constexpr int kMinLogSlice = 10;
     constexpr int kMaxLogSlice = 16;  // at most 2048 bytes per lane, so a run's extra bits fit one rANS op
     constexpr int kMaxLogSegment = 24;
     constexpr int kMaxContexts = 16;
+    constexpr int kMinLogSample = 8;
+    constexpr int kMaxLogSample = 31;
 
     constexpr int kProbBits = 11;  // 2 KiB decoding tables per context
     constexpr uint32_t kProbScale = 1u << kProbBits;
@@ -46,6 +48,11 @@ namespace bwarp {
 #else
         return 31 - static_cast<uint32_t>(std::countl_zero(x));
 #endif
+    }
+
+    // The rows of text positions j * 2^logSample, j >= 1, where the inverse BWT's chains start.
+    BWARP_HD uint32_t sampleCount(uint32_t n, int logSample) {
+        return n == 0 ? 0 : (n - 1) >> logSample;
     }
 
     BWARP_HD uint32_t laneBytes(uint32_t sliceBytes) {

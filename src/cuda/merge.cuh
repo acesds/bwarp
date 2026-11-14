@@ -34,6 +34,8 @@ namespace gpusa {
         const uint32_t* lists;  // text positions, the sorted lists concatenated
         uint32_t n;
         ClassLists layout;
+        uint32_t* samples = nullptr;  // Bwt: the row of text position p at samples[(p >> logSample) - 1], p > 0
+        uint32_t logSample = 0;
     };
 
     __device__ __forceinline__ int listOf(const ClassLists& layout, uint32_t index) {
@@ -351,14 +353,19 @@ namespace gpusa {
         return p == 0 ? 0 : reinterpret_cast<const uint8_t*>(in.text)[p - 1];
     }
 
+    // Bwt: rows are those of the n + 1 rotations, the sentinel's first, so suffix p's is r + 1.
     template <MergeOutput kOut>
-    __device__ __forceinline__ void writeOutput(uint32_t* out, uint32_t r, uint32_t index, uint32_t p, uint8_t before, uint32_t* suffixZeroRow) {
+    __device__ __forceinline__ void writeOutput(const MergeInput& in, uint32_t* out, uint32_t r, uint32_t index, uint32_t p, uint8_t before, uint32_t* suffixZeroRow) {
         if constexpr (kOut == MergeOutput::Indices) {
             out[r] = index;
         } else if (p == 0) {
             *suffixZeroRow = r;
         } else {
             reinterpret_cast<uint8_t*>(out)[r + 1] = before;
+
+            if (in.samples && (p & ((1u << in.logSample) - 1)) == 0) {
+                in.samples[(p >> in.logSample) - 1] = r + 1;
+            }
         }
     }
 
@@ -490,7 +497,7 @@ namespace gpusa {
 
             const uint32_t r = e - info.segment[l] + ((counts[e / 2] >> (16 * (e % 2))) & 0xFFFF);
 
-            writeOutput<kOut>(out, info.outBase + r, info.source[l] + e - info.segment[l], records[e].position,
+            writeOutput<kOut>(in, out, info.outBase + r, info.source[l] + e - info.segment[l], records[e].position,
                 kOut == MergeOutput::Bwt ? before[k] : 0, suffixZeroRow);
         }
     }
@@ -572,7 +579,7 @@ namespace gpusa {
                     r += lo;
                 }
 
-                writeOutput<kOut>(out, info.outBase + r, index, p,
+                writeOutput<kOut>(in, out, info.outBase + r, index, p,
                     kOut == MergeOutput::Bwt ? characterBefore(in, p) : 0, suffixZeroRow);
             }
         }

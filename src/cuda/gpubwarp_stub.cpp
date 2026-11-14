@@ -34,11 +34,12 @@ GpuStatus gpuCreateBwtContext(int32_t, GpuBwtContext*& context) {
 
 void gpuDestroyBwtContext(GpuBwtContext*) {}
 
-GpuStatus gpuBwt(GpuBwtContext*, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats) {
-    return gpuBwt(text, n, bwt, primary, stats);
+GpuStatus gpuBwt(GpuBwtContext*, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats,
+    uint32_t* samples, int logSample) {
+    return gpuBwt(text, n, bwt, primary, stats, samples, logSample);
 }
 
-GpuStatus gpuBwt(const uint8_t*, int32_t, uint8_t*, int32_t& primary, GpuBwtStats* stats) {
+GpuStatus gpuBwt(const uint8_t*, int32_t, uint8_t*, int32_t& primary, GpuBwtStats* stats, uint32_t*, int) {
     primary = -1;
 
     if (stats) {
@@ -51,6 +52,14 @@ GpuStatus gpuBwt(const uint8_t*, int32_t, uint8_t*, int32_t& primary, GpuBwtStat
 GpuStatus gpuDecode(const uint8_t*, size_t, std::vector<uint8_t>&, int32_t& primary, GpuDecodeStats* stats) {
     primary = -1;
 
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuDecompress(const uint8_t*, size_t, std::vector<uint8_t>&, GpuDecodeStats* stats) {
     if (stats) {
         *stats = GpuDecodeStats{};
     }

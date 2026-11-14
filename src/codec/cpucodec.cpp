@@ -493,22 +493,80 @@ namespace {
     }
 }
 
-bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const EncodeParams& params, std::vector<uint8_t>& out,
-    EncodeStats* stats) {
+int chooseLogSample(uint32_t n, uint64_t codedBytes, int recordedLogSample) {
+    using namespace bwarp;
+
+    // More chains than 2^13 don't make the inverse faster; fewer cost speed where psi fits the L2.
+    const int floor = std::max(recordedLogSample, kAutoMinLogSample);
+    const int enough = n > 0 ? static_cast<int>(floorLog2(n)) - kAutoLogChains : 0;
+    int k = std::clamp(enough, floor, std::max(floor, kAutoMaxLogSample));
+
+    while (k < std::max(floor, kAutoMaxLogSample) && uint64_t(sampleCount(n, k)) * 4 * kAutoSampleShare > codedBytes) {
+        k++;
+    }
+
+    return k;
+}
+
+bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats) {
     EncodeStats local;
     EncodeStats& s = stats ? *stats : local;
 
     s = EncodeStats{};
 
-    if (n < 0 || !validParams(params.logSegment, params.logSlice, params.contexts)) {
+    if (n < 0 || !validParams(params.logSegment, params.logSlice, params.contexts, kMaxLogSample) ||
+        recordedLogSample < kMinLogSample || recordedLogSample > kMaxLogSample ||
+        (params.logSample != 0 && (params.logSample < recordedLogSample || params.logSample > kMaxLogSample)) ||
+        !validRow(static_cast<uint32_t>(primary), static_cast<uint32_t>(n))) {
         return false;
     }
 
-    const Layout layout(static_cast<uint32_t>(n), params.logSegment, params.logSlice);
+    for (uint32_t j = 0; j < sampleCount(static_cast<uint32_t>(n), recordedLogSample); j++) {
+        if (!validRow(samples[j], static_cast<uint32_t>(n))) {
+            return false;
+        }
+    }
+
+    // The tables and streams first, at offsets relative to their start, as the samples kept depend on their size.
+    const Layout coding(static_cast<uint32_t>(n), params.logSegment, params.logSlice, kMaxLogSample);
     const uint32_t lengthCodes = lengthCodeCount(params.logSlice);
-    std::vector<uint64_t> segmentOffsets(layout.segments + 1), sliceOffsets(layout.slices + 1);
-    std::vector<std::unique_ptr<Model>> models(layout.segments);
+    std::vector<uint64_t> segmentOffsets(coding.segments + 1), sliceOffsets(coding.slices + 1);
+    std::vector<std::unique_ptr<Model>> models(coding.segments);
     std::vector<Run> runs;
+    std::vector<uint8_t> body;
+
+    for (uint32_t g = 0; g < coding.segments; g++) {
+        runs.clear();
+
+        for (uint32_t sl = coding.firstSlice(g); sl < coding.endSlice(g); sl++) {
+            for (int j = 0; j < kLanes; j++) {
+                uint32_t laneBegin, laneEnd;
+
+                laneRange(coding.sliceBegin(sl), coding.sliceEnd(sl), j, laneBegin, laneEnd);
+                tokenize(bwt, laneBegin, laneEnd, runs);
+            }
+        }
+
+        models[g] = std::make_unique<Model>();
+        segmentOffsets[g] = body.size();
+        chooseModel(runs, static_cast<uint32_t>(params.contexts), lengthCodes, *models[g], body);
+    }
+
+    segmentOffsets[coding.segments] = body.size();
+
+    for (uint32_t g = 0; g < coding.segments; g++) {
+        for (uint32_t sl = coding.firstSlice(g); sl < coding.endSlice(g); sl++) {
+            sliceOffsets[sl] = body.size();
+            encodeSlice(bwt, coding.sliceBegin(sl), coding.sliceEnd(sl), *models[g], body, s.tokens);
+        }
+    }
+
+    sliceOffsets[coding.slices] = body.size();
+
+    const int logSample =
+        params.logSample != 0 ? params.logSample : chooseLogSample(coding.n, body.size(), recordedLogSample);
+    const Layout layout(coding.n, params.logSegment, params.logSlice, logSample);
 
     out.assign(layout.indexBytes(), 0);
     put32(&out[0], kMagic);
@@ -516,57 +574,40 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const EncodeParam
     out[5] = kTransformBwt;
     out[6] = static_cast<uint8_t>(params.logSegment);
     out[7] = static_cast<uint8_t>(params.logSlice);
-    put32(&out[8], static_cast<uint32_t>(n));
-    put32(&out[12], static_cast<uint32_t>(primary));
+    out[8] = static_cast<uint8_t>(logSample);
+    put32(&out[12], layout.n);
+    put32(&out[16], static_cast<uint32_t>(primary));
 
-    for (uint32_t g = 0; g < layout.segments; g++) {
-        runs.clear();
-
-        for (uint32_t sl = layout.firstSlice(g); sl < layout.endSlice(g); sl++) {
-            for (int j = 0; j < kLanes; j++) {
-                uint32_t laneBegin, laneEnd;
-
-                laneRange(layout.sliceBegin(sl), layout.sliceEnd(sl), j, laneBegin, laneEnd);
-                tokenize(bwt, laneBegin, laneEnd, runs);
-            }
-        }
-
-        models[g] = std::make_unique<Model>();
-        segmentOffsets[g] = out.size();
-        chooseModel(runs, static_cast<uint32_t>(params.contexts), lengthCodes, *models[g], out);
+    // Position j * 2^logSample is recorded sample j * 2^(logSample - recorded) - 1.
+    for (uint32_t j = 0; j < layout.samples; j++) {
+        const uint64_t recorded = (uint64_t(j + 1) << (logSample - recordedLogSample)) - 1;
+        put32(&out[layout.samplesAt() + 4 * size_t(j)], samples[recorded]);
     }
 
-    segmentOffsets[layout.segments] = out.size();
-
-    for (uint32_t g = 0; g < layout.segments; g++) {
-        for (uint32_t sl = layout.firstSlice(g); sl < layout.endSlice(g); sl++) {
-            sliceOffsets[sl] = out.size();
-            encodeSlice(bwt, layout.sliceBegin(sl), layout.sliceEnd(sl), *models[g], out, s.tokens);
-        }
-    }
-
-    sliceOffsets[layout.slices] = out.size();
-
-    uint8_t* index = &out[kHeaderBytes];
+    uint8_t* index = &out[layout.offsetsAt()];
 
     for (const uint64_t offset : segmentOffsets) {
-        put64(index, offset);
+        put64(index, layout.indexBytes() + offset);
         index += 8;
     }
 
     for (const uint64_t offset : sliceOffsets) {
-        put64(index, offset);
+        put64(index, layout.indexBytes() + offset);
         index += 8;
     }
 
+    out.insert(out.end(), body.begin(), body.end());
+
+    s.logSample = logSample;
     s.indexBytes = static_cast<int64_t>(layout.indexBytes());
-    s.tableBytes = static_cast<int64_t>(segmentOffsets[layout.segments] - segmentOffsets[0]);
-    s.streamBytes = static_cast<int64_t>(sliceOffsets[layout.slices] - sliceOffsets[0]);
+    s.tableBytes = static_cast<int64_t>(segmentOffsets[coding.segments] - segmentOffsets[0]);
+    s.streamBytes = static_cast<int64_t>(sliceOffsets[coding.slices] - sliceOffsets[0]);
 
     return true;
 }
 
-bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary) {
+bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
+    std::vector<uint32_t>* samples) {
     Container container;
 
     if (!readContainer(data, size, container)) {
@@ -582,6 +623,10 @@ bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int3
 
     bwt.assign(layout.n, 0);
     primary = container.primary;
+
+    if (samples) {
+        *samples = container.samples;
+    }
 
     for (uint32_t g = 0; g < layout.segments; g++) {
         *model = Model{};

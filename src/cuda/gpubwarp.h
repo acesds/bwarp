@@ -77,8 +77,12 @@ GpuStatus gpuCreateBwtContext(int32_t capacity, GpuBwtContext*& context);
 void gpuDestroyBwtContext(GpuBwtContext* context);
 
 // The BWT of text plus a sentinel, without the sentinel; primary is the sentinel's row. bwt may be text.
-GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats = nullptr);
-GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats = nullptr);
+// With samples, also the rows of text positions j * 2^logSample for j >= 1, sampleCount(n, logSample) of them
+// (logSample at least 8). Rows count the sentinel's, row 0; primary is that of position 0.
+GpuStatus gpuBwt(GpuBwtContext* context, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary,
+    GpuBwtStats* stats = nullptr, uint32_t* samples = nullptr, int logSample = 0);
+GpuStatus gpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats = nullptr,
+    uint32_t* samples = nullptr, int logSample = 0);
 
 // ---- Decoding ----------------------------------------------------------------------------------
 
@@ -89,9 +93,14 @@ struct GpuDecodeStats {
     double tableSeconds = 0.0;   // decoding the tables
     double finishSeconds = 0.0;  // their frequencies and slot tables
     double streamSeconds = 0.0;
+    double sortSeconds = 0.0;   // gpuDecompress(): the inverse BWT's psi
+    double chainSeconds = 0.0;  // and its chains
     double downloadSeconds = 0.0;
 };
 
 // Decodes bwarp data, with the same result as decodeBwt().
 GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
     GpuDecodeStats* stats = nullptr);
+
+// Decodes bwarp data and inverts the BWT on the device: the original text.
+GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats = nullptr);

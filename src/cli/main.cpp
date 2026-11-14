@@ -20,6 +20,7 @@
 #include <vector>
 #include "checker.h"
 #include "cpucodec.h"
+#include "format.h"
 #include "fileio.h"
 #include "gpubwarp.h"
 #include "selftest.h"
@@ -73,8 +74,8 @@ namespace {
             "  bwarp check <in> <in.bwt>\n"
             "  bwarp test <in|dir> [--recursive]\n"
             "  bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]\n"
-            "  bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--gpu [--verbose]]\n"
-            "              [--recursive]\n"
+            "  bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2]\n"
+            "              [--gpu [--verbose]] [--recursive]\n"
             "  bwarp selftest [--verbose]\n"
             "\n"
             "The .bwt file is divsufsort's bwt format as one block: n, the primary index, the n bytes\n"
@@ -91,9 +92,12 @@ namespace {
             "ratio builds the BWT on the GPU, encodes and decodes it with the CPU reference codec,\n"
             "checks the round trip and prints the compressed sizes. --segment (default 15): frequency\n"
             "tables per 2^LOG2 bytes; --slice (default 15, 10 to 16): one 32-lane stream per 2^LOG2\n"
-            "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use.\n"
-            "--gpu also decodes on the GPU, checks it, and prints its speed without transfers (the\n"
-            "faster of two runs) and that of its stream kernel; --verbose adds the phases.\n");
+            "bytes; --contexts (default 16, 1 to 16): the most symbol contexts a table may use;\n"
+            "--sample (10 to 31; default automatic, see chooseLogSample()): an inverse BWT chain per\n"
+            "2^LOG2 bytes.\n"
+            "--gpu also decompresses on the GPU, checks the text, and prints its speed without\n"
+            "transfers (the faster of two runs), that of the stream kernel and that of the inverse\n"
+            "BWT; --verbose adds the phases.\n");
     }
 
     bool parseOptions(int argc, char** argv, Options& options) {
@@ -113,6 +117,8 @@ namespace {
                 options.encode.logSlice = atoi(argv[++i]);
             } else if (strcmp(arg, "--contexts") == 0 && i + 1 < argc) {
                 options.encode.contexts = atoi(argv[++i]);
+            } else if (strcmp(arg, "--sample") == 0 && i + 1 < argc) {
+                options.encode.logSample = atoi(argv[++i]);
             } else if (strcmp(arg, "--context") == 0) {
                 options.context = true;
             } else if (strcmp(arg, "--gpu") == 0) {
@@ -175,8 +181,9 @@ namespace {
     }
 
     // bwt may be text.
-    bool runGpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, double& seconds, GpuBwtStats& stats) {
-        const GpuStatus status = gpuBwt(text, n, bwt, primary, &stats);
+    bool runGpuBwt(const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, double& seconds, GpuBwtStats& stats,
+        uint32_t* samples = nullptr, int logSample = 0) {
+        const GpuStatus status = gpuBwt(text, n, bwt, primary, &stats, samples, logSample);
         seconds = stats.uploadSeconds + stats.deviceSeconds + stats.downloadSeconds;
         return reportGpu(status);
     }
@@ -594,8 +601,9 @@ namespace {
         int64_t compressed = 0;
         double encodeSeconds = 0.0;
         double decodeSeconds = 0.0;
-        double gpuSeconds = 0.0;  // the decoder's device phases
+        double gpuSeconds = 0.0;  // the decompressor's device phases
         double gpuStreamSeconds = 0.0;
+        double gpuInverseSeconds = 0.0;
 
         void add(const RatioRun& other) {
             bytes += other.bytes;
@@ -608,6 +616,7 @@ namespace {
             decodeSeconds += other.decodeSeconds;
             gpuSeconds += other.gpuSeconds;
             gpuStreamSeconds += other.gpuStreamSeconds;
+            gpuInverseSeconds += other.gpuInverseSeconds;
         }
     };
 
@@ -622,8 +631,8 @@ namespace {
             megabytesPerSecond(run.bytes, run.decodeSeconds));
 
         if (gpu) {
-            printf(" %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuSeconds),
-                megabytesPerSecond(run.bytes, run.gpuStreamSeconds));
+            printf(" %8.1f %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuSeconds),
+                megabytesPerSecond(run.bytes, run.gpuStreamSeconds), megabytesPerSecond(run.bytes, run.gpuInverseSeconds));
         }
 
         printf("  %s\n", verdict);
@@ -644,68 +653,89 @@ namespace {
             return kExitError;
         }
 
-        printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts (CPU reference codec)\n", options.paths[0],
-            files.size(), files.size() == 1 ? "" : "s", params.logSegment, params.logSlice, params.contexts);
+        const std::string sampling = params.logSample != 0 ? "2^" + std::to_string(params.logSample) : "auto";
+
+        printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts, samples %s (CPU reference codec)\n",
+            options.paths[0], files.size(), files.size() == 1 ? "" : "s", params.logSegment, params.logSlice,
+            params.contexts, sampling.c_str());
         printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s", nameWidth, "file", "bytes", "compressed", "bpc", "runs/n",
             "tab%", "idx%", "enc MB/s", "dec MB/s");
-        printf(options.gpu ? " %8s %8s\n" : "\n", "gpu MB/s", "str MB/s");
+        printf(options.gpu ? " %8s %8s %8s\n" : "\n", "gpu MB/s", "str MB/s", "inv MB/s");
 
         RatioRun total;
         size_t passed = 0;
 
         for (size_t i = 0; i < files.size(); i++) {
-            std::vector<uint8_t> text, encoded, decoded;
+            std::vector<uint8_t> text, bwt, encoded, decoded;
+            std::vector<uint32_t> samples, decodedSamples;
             int32_t n, primary = 0, decodedPrimary = -1;
             double gpuSeconds;
             GpuBwtStats gpuStats;
             RatioRun run;
 
-            if (!loadText(files[i].string().c_str(), text, n) ||
-                !runGpuBwt(text.data(), n, text.data(), primary, gpuSeconds, gpuStats)) {
+            if (params.logSample != 0 && (params.logSample < kAutoMinLogSample || params.logSample > bwarp::kMaxLogSample)) {
+                printf("bwarp: invalid --sample\n");
+                return kExitError;
+            }
+
+            if (!loadText(files[i].string().c_str(), text, n)) {
+                continue;
+            }
+
+            bwt.resize(n);
+            samples.resize(bwarp::sampleCount(static_cast<uint32_t>(n), kAutoMinLogSample));
+
+            if (!runGpuBwt(text.data(), n, bwt.data(), primary, gpuSeconds, gpuStats, samples.data(), kAutoMinLogSample)) {
                 continue;
             }
 
             auto start = std::chrono::steady_clock::now();
 
-            if (!encodeBwt(text.data(), n, primary, params, encoded, &run.stats)) {
+            if (!encodeBwt(bwt.data(), n, primary, samples.data(), kAutoMinLogSample, params, encoded, &run.stats)) {
                 printf("bwarp: invalid --segment, --slice or --contexts\n");
                 return kExitError;
             }
 
             run.encodeSeconds = secondsSince(start);
             start = std::chrono::steady_clock::now();
-            const bool decodedOk = decodeBwt(encoded.data(), encoded.size(), decoded, decodedPrimary);
+            const bool decodedOk = decodeBwt(encoded.data(), encoded.size(), decoded, decodedPrimary, &decodedSamples);
             run.decodeSeconds = secondsSince(start);
             run.bytes = n;
             run.compressed = static_cast<int64_t>(encoded.size());
 
-            bool ok = decodedOk && decodedPrimary == primary && decoded == text;
+            bool ok = decodedOk && decodedPrimary == primary && decoded == bwt;
+
+            for (size_t j = 0; ok && j < decodedSamples.size(); j++) {
+                ok = decodedSamples[j] == samples[((j + 1) << (run.stats.logSample - kAutoMinLogSample)) - 1];
+            }
 
             // The faster of two runs, the first one warming up.
             for (int r = 0; options.gpu && ok && r < 2; r++) {
                 GpuDecodeStats stats;
-                const GpuStatus status = gpuDecode(encoded.data(), encoded.size(), decoded, decodedPrimary, &stats);
+                const GpuStatus status = gpuDecompress(encoded.data(), encoded.size(), decoded, &stats);
 
                 if (!reportGpu(status)) {
                     ok = false;
                     break;
                 }
 
-                ok = decodedPrimary == primary && decoded == text;
+                ok = decoded == text;
 
-                const double device = stats.tableSeconds + stats.finishSeconds + stats.streamSeconds;
+                const double inverse = stats.sortSeconds + stats.chainSeconds;
+                const double device = stats.tableSeconds + stats.finishSeconds + stats.streamSeconds + inverse;
 
                 if (r == 0 || device < run.gpuSeconds) {
                     run.gpuSeconds = device;
                     run.gpuStreamSeconds = stats.streamSeconds;
+                    run.gpuInverseSeconds = inverse;
                 }
 
                 if (options.verbose && r == 1) {
-                    printf("  GPU decoder: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, "
-                           "download %.2f ms, %lld MiB\n",
+                    printf("  GPU: upload %.2f ms, tables %.2f ms, finishing %.2f ms, streams %.2f ms, psi %.2f ms, "
+                           "chains %.2f ms, download %.2f ms, %lld MiB\n",
                         1e3 * stats.uploadSeconds, 1e3 * stats.tableSeconds, 1e3 * stats.finishSeconds,
-                        1e3 * stats.streamSeconds, 1e3 * stats.downloadSeconds,
-                        static_cast<long long>(stats.deviceBytes >> 20));
+                        1e3 * stats.streamSeconds, 1e3 * stats.sortSeconds, 1e3 * stats.chainSeconds,
+                        1e3 * stats.downloadSeconds, static_cast<long long>(stats.deviceBytes >> 20));
                 }
             }
 

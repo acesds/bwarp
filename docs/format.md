@@ -11,14 +11,21 @@ A bwarp file holds the BWT of one block of up to 2^31 − 1 bytes. All integers 
 | 1 | transform, 0 = BWT |
 | 1 | logSegment, logSlice ≤ logSegment ≤ 24 |
 | 1 | logSlice, 10 to 16 |
+| 1 | logSample, 8 to 31 |
+| 3 | zero |
 | 4 | n, the text length |
 | 4 | primary, the sentinel's row among the sorted rotations |
+| 4 × samples | sample rows |
 | 8 × (segments + 1) | segment offsets |
 | 8 × (slices + 1) | slice offsets |
 | | the segment tables, in order |
 | | the slice streams, in order |
 
 The BWT is that of the text plus a sentinel smaller than every byte, with the sentinel left out, so it has n bytes.
+
+**Samples** let the inverse BWT run as many independent chains. Counting the n + 1 sorted rotations from 0 (the one starting with the sentinel), sample j − 1 is the row of the rotation starting at text position j × 2^logSample, for 1 ≤ j and j × 2^logSample < n, so there are `samples = floor((n − 1) / 2^logSample)` of them (0 for n = 0). primary is the row of position 0. Every row is in [1, n] (primary is 0 for n = 0). Chain j decodes positions [j × 2^logSample, (j + 1) × 2^logSample) forward from its row.
+
+bwarp's encoder picks the smallest logSample in [10, 16] that gives at most 2^13 chains or whose samples take at most 1/128 of the tables and streams.
 
 It is cut into slices of 2^logSlice bytes and segments of 2^logSegment bytes (the last of each may be shorter): `slices = ceil(n / 2^logSlice)`, `segments = ceil(n / 2^logSegment)`. Segment g's table models slices [g × 2^(logSegment − logSlice), …).
 
