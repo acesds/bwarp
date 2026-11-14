@@ -40,6 +40,13 @@ set(COMMON_SOURCES
     src/common/fileio.cpp
 )
 
+# The format's shared primitives (format) and its reference encoder and decoder (cpucodec).
+set(CODEC_SOURCES
+    src/codec/format.h
+    src/codec/cpucodec.h
+    src/codec/cpucodec.cpp
+)
+
 # The bwarp.exe command line: commands (main) and the built-in test suite (selftest).
 set(CLI_SOURCES
     src/cli/main.cpp
@@ -49,6 +56,7 @@ set(CLI_SOURCES
 
 set(BWARP_SOURCES
     ${COMMON_SOURCES}
+    ${CODEC_SOURCES}
     ${CLI_SOURCES}
     src/cuda/gpubwarp.h
 )
@@ -58,7 +66,7 @@ if(NOT CMAKE_CUDA_COMPILER)
 endif()
 
 add_executable(${PROJECT_NAME} ${BWARP_SOURCES})
-target_include_directories(${PROJECT_NAME} PRIVATE src/common src/cuda src/cli)
+target_include_directories(${PROJECT_NAME} PRIVATE src/common src/codec src/cuda src/cli)
 source_group(TREE "${CMAKE_SOURCE_DIR}/src" FILES ${BWARP_SOURCES})
 
 # The GPU variant: device code compiled by nvcc, with MSVC's cl.exe as host compiler on

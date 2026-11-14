@@ -3,7 +3,7 @@
  *
  * Included only by gpubwarp.cu, so the __constant__ tables need no relocatable device code.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * From sadcs (https://github.com/acesds/sadcs), BWT path only.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.

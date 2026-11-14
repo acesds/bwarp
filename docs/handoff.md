@@ -1,6 +1,6 @@
 # bwarp: handoff
 
-**bwarp** is a GPU-based entropy coder for BWT output, built for very high throughput in both directions. The name combines BWT and warp, the GPU's unit of lockstep execution that the decoder is built around. The BWT itself comes from sadcs (`C:\Users\Anwender\Code\repos\sadcs`), which stays unchanged.
+**bwarp** is a GPU-based BWT file compressor, built for very high throughput in both directions. The name combines BWT and warp, the GPU's unit of lockstep execution that the decoder is built around. The BWT construction is taken from sadcs (`C:\Users\Anwender\Code\repos\sadcs`, BWT path only); sadcs itself stays unchanged.
 
 This document records the discussion of 2026-11-14: the goal, the reasoning behind the chosen design, the options that were set aside, and the first steps. Nothing has been built or measured yet. Every number below is either a sadcs measurement or an estimate, and each one says which.
 

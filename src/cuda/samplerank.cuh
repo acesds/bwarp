@@ -6,7 +6,7 @@
  * then stably by group id, and splits groups where the subkey changes. Groups of one leave the list.
  * Doubling rounds use the group id at p + h, h = 32, 64, ... (Larsson-Sadakane without in-round refinement).
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * From sadcs (https://github.com/acesds/sadcs), BWT path only.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.

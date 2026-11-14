@@ -4,7 +4,7 @@
  * For any positions i and j there's a k < 32 with i + k and j + k both sampled, so two suffixes agreeing
  * on k characters are ordered by the sample ranks at i + k and j + k.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * From sadcs (https://github.com/acesds/sadcs), BWT path only.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.

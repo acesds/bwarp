@@ -1,7 +1,7 @@
 /*
  * main.cpp - The bwarp command line.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.
  * https://opensource.org/licenses/MIT
@@ -19,6 +19,7 @@
 #include <system_error>
 #include <vector>
 #include "checker.h"
+#include "cpucodec.h"
 #include "fileio.h"
 #include "gpubwarp.h"
 #include "selftest.h"
@@ -37,6 +38,7 @@ namespace {
         int runs = 5;
         bool context = false;
         bool pinned = false;
+        EncodeParams encode;
     };
 
     struct TestRun {
@@ -62,7 +64,7 @@ namespace {
 
     void printUsage() {
         printf(
-            "bwarp - GPU entropy coding and inverse transform for BWT output\n"
+            "bwarp - a GPU-based BWT file compressor\n"
             "\n"
             "usage:\n"
             "  bwarp info\n"
@@ -70,6 +72,7 @@ namespace {
             "  bwarp check <in> <in.bwt>\n"
             "  bwarp test <in|dir> [--recursive]\n"
             "  bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]\n"
+            "  bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--recursive]\n"
             "  bwarp selftest [--verbose]\n"
             "\n"
             "The .bwt file is divsufsort's bwt format as one block: n, the primary index, the n bytes\n"
@@ -82,7 +85,11 @@ namespace {
             "bench times the GPU build: a warmup, then the best of --runs (default 5) host-to-host runs,\n"
             "with each phase of the best one. It doesn't check the output; test does. --context reuses\n"
             "one GPU context per file, created before the runs and not timed. --pinned uses page-locked\n"
-            "host buffers, allocated before the runs (--context --pinned is how libcubwt measures).\n");
+            "host buffers, allocated before the runs (--context --pinned is how libcubwt measures).\n"
+            "ratio builds the BWT on the GPU, encodes and decodes it with the CPU reference codec,\n"
+            "checks the round trip and prints the compressed sizes. --segment (default 20): frequency\n"
+            "tables per 2^LOG2 bytes; --slice (default 15, 10 to 17): one 32-lane stream per 2^LOG2\n"
+            "bytes; --contexts (default 8, 1 to 16): symbol contexts.\n");
     }
 
     bool parseOptions(int argc, char** argv, Options& options) {
@@ -96,6 +103,12 @@ namespace {
                     printf("bwarp: --runs must be at least 1\n");
                     return false;
                 }
+            } else if (strcmp(arg, "--segment") == 0 && i + 1 < argc) {
+                options.encode.logSegment = atoi(argv[++i]);
+            } else if (strcmp(arg, "--slice") == 0 && i + 1 < argc) {
+                options.encode.logSlice = atoi(argv[++i]);
+            } else if (strcmp(arg, "--contexts") == 0 && i + 1 < argc) {
+                options.encode.contexts = atoi(argv[++i]);
             } else if (strcmp(arg, "--context") == 0) {
                 options.context = true;
             } else if (strcmp(arg, "--pinned") == 0) {
@@ -495,32 +508,44 @@ namespace {
             megabytesPerSecond(run.bytes, run.seconds), run.peakPerByte);
     }
 
-    int cmdBench(const Options& options) {
-        if (options.pathCount != 1) {
-            printUsage();
-            return kExitError;
-        }
-
+    // The file at path, or the files in it; names for the table rows.
+    bool collectFiles(const Options& options, std::vector<std::filesystem::path>& files, std::vector<std::string>& names,
+        int& nameWidth) {
         const std::filesystem::path path(options.paths[0]);
-        std::vector<std::filesystem::path> files;
         std::error_code error;
         const bool directory = std::filesystem::is_directory(path, error);
 
         if (directory && !listFiles(path, options.recursive, files)) {
             printf("bwarp: cannot list directory '%s'\n", options.paths[0]);
-            return kExitError;
+            return false;
         }
 
         if (!directory) {
             files.push_back(path);
         }
 
-        std::vector<std::string> names;
-        int nameWidth = 5;
+        nameWidth = 5;
 
         for (const auto& file : files) {
             names.push_back(directory ? file.lexically_relative(path).generic_string() : file.filename().string());
             nameWidth = std::max(nameWidth, static_cast<int>(names.back().size()));
+        }
+
+        return true;
+    }
+
+    int cmdBench(const Options& options) {
+        std::vector<std::filesystem::path> files;
+        std::vector<std::string> names;
+        int nameWidth;
+
+        if (options.pathCount != 1) {
+            printUsage();
+            return kExitError;
+        }
+
+        if (!collectFiles(options, files, names, nameWidth)) {
+            return kExitError;
         }
 
         GpuDevice device;
@@ -555,6 +580,100 @@ namespace {
 
         return kExitOk;
     }
+
+    struct RatioRun {
+        int64_t bytes = 0;
+        EncodeStats stats;
+        int64_t compressed = 0;
+        double encodeSeconds = 0.0;
+        double decodeSeconds = 0.0;
+
+        void add(const RatioRun& other) {
+            bytes += other.bytes;
+            stats.indexBytes += other.stats.indexBytes;
+            stats.tableBytes += other.stats.tableBytes;
+            stats.streamBytes += other.stats.streamBytes;
+            stats.tokens += other.stats.tokens;
+            compressed += other.compressed;
+            encodeSeconds += other.encodeSeconds;
+            decodeSeconds += other.decodeSeconds;
+        }
+    };
+
+    void printRatioRow(const char* name, int nameWidth, const RatioRun& run, const char* verdict) {
+        const auto percent = [&](int64_t part) { return run.compressed > 0 ? 100.0 * part / run.compressed : 0.0; };
+
+        printf("%-*s %12lld %12lld %6.3f %8.4f %6.2f %6.2f %8.1f %8.1f  %s\n", nameWidth, name,
+            static_cast<long long>(run.bytes), static_cast<long long>(run.compressed),
+            run.bytes > 0 ? 8.0 * run.compressed / run.bytes : 0.0,
+            run.bytes > 0 ? static_cast<double>(run.stats.tokens) / run.bytes : 0.0, percent(run.stats.tableBytes),
+            percent(run.stats.indexBytes), megabytesPerSecond(run.bytes, run.encodeSeconds),
+            megabytesPerSecond(run.bytes, run.decodeSeconds), verdict);
+    }
+
+    int cmdRatio(const Options& options) {
+        std::vector<std::filesystem::path> files;
+        std::vector<std::string> names;
+        int nameWidth;
+        const EncodeParams& params = options.encode;
+
+        if (options.pathCount != 1) {
+            printUsage();
+            return kExitError;
+        }
+
+        if (!collectFiles(options, files, names, nameWidth)) {
+            return kExitError;
+        }
+
+        printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts (CPU reference codec)\n", options.paths[0],
+            files.size(), files.size() == 1 ? "" : "s", params.logSegment, params.logSlice, params.contexts);
+        printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s\n", nameWidth, "file", "bytes", "compressed", "bpc",
+            "runs/n", "tab%", "idx%", "enc MB/s", "dec MB/s");
+
+        RatioRun total;
+        size_t passed = 0;
+
+        for (size_t i = 0; i < files.size(); i++) {
+            std::vector<uint8_t> text, encoded, decoded;
+            int32_t n, primary = 0, decodedPrimary = -1;
+            double gpuSeconds;
+            GpuBwtStats gpuStats;
+            RatioRun run;
+
+            if (!loadText(files[i].string().c_str(), text, n) ||
+                !runGpuBwt(text.data(), n, text.data(), primary, gpuSeconds, gpuStats)) {
+                continue;
+            }
+
+            auto start = std::chrono::steady_clock::now();
+
+            if (!encodeBwt(text.data(), n, primary, params, encoded, &run.stats)) {
+                printf("bwarp: invalid --segment, --slice or --contexts\n");
+                return kExitError;
+            }
+
+            run.encodeSeconds = secondsSince(start);
+            start = std::chrono::steady_clock::now();
+            const bool decodedOk = decodeBwt(encoded.data(), encoded.size(), decoded, decodedPrimary);
+            run.decodeSeconds = secondsSince(start);
+            run.bytes = n;
+            run.compressed = static_cast<int64_t>(encoded.size());
+
+            const bool ok = decodedOk && decodedPrimary == primary && decoded == text;
+
+            printRatioRow(names[i].c_str(), nameWidth, run, ok ? "OK" : "FAILED");
+            total.add(run);
+            passed += ok ? 1 : 0;
+        }
+
+        if (files.size() > 1) {
+            const std::string verdict = std::to_string(passed) + "/" + std::to_string(files.size()) + " OK";
+            printRatioRow("total", nameWidth, total, verdict.c_str());
+        }
+
+        return passed == files.size() ? kExitOk : kExitError;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -588,6 +707,10 @@ int main(int argc, char** argv) {
 
     if (strcmp(command, "bench") == 0) {
         return cmdBench(options);
+    }
+
+    if (strcmp(command, "ratio") == 0) {
+        return cmdRatio(options);
     }
 
     if (strcmp(command, "selftest") == 0) {

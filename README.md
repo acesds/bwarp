@@ -1,18 +1,19 @@
 # bwarp
 
-Fast BWT compression on the GPU: interleaved rANS coding and parallel inverse BWT.
+A GPU-based BWT file compressor: the Burrows–Wheeler transform, entropy coding and the inverse transform all run on the GPU.
 
-bwarp is the entropy stage and inverse transform for BWTs built by [sadcs](https://github.com/acesds/sadcs). The goal is throughput in both directions with the data staying on the device; ratio comes second. [docs/handoff.md](docs/handoff.md) has the design and the reasoning behind it.
+The BWT construction comes from [sadcs](https://github.com/acesds/sadcs); the entropy coder is interleaved rANS, one state per warp lane. The goal is throughput in both directions with the data staying on the device; ratio comes second. [docs/handoff.md](docs/handoff.md) has the design and the reasoning behind it.
 
 ## Status
 
-Scaffold only. What exists so far:
+What exists so far:
 
 - The build: clang-cl or MSVC for the C++ sources, nvcc for the GPU variant.
 - sadcs's GPU BWT construction and its BWT checker, BWT path only (see [From sadcs](#from-sadcs)).
+- Format v0 ([docs/format.md](docs/format.md)) with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
 - The command line and a selftest.
 
-Next are the steps in [First steps](docs/handoff.md#first-steps): the GPU inverse BWT microbenchmark, then the CPU ratio prototype.
+Next: ratio tuning on the CPU reference, then the GPU decoder and encoder, then the GPU inverse BWT.
 
 ## Command line
 
@@ -22,6 +23,7 @@ bwarp bwt <in> <out.bwt>
 bwarp check <in> <in.bwt>
 bwarp test <in|dir> [--recursive]
 bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]
+bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--recursive]
 bwarp selftest [--verbose]
 ```
 
@@ -32,7 +34,8 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block, the same as `
 - `check`: verify a BWT file against its text by inverting it on the CPU (sequential, about 12 MB/s on enwik8).
 - `test`: build and check in memory, with the GPU's phases and memory. On a directory it runs every file in it (`--recursive` to include subdirectories), one row per file plus a total.
 - `bench`: time the GPU build, the best of `--runs` (default 5) after a warmup, with each phase. `--context` reuses one GPU context per file, `--pinned` uses page-locked host buffers. `--context --pinned` measures the way libcubwt's benchmark does.
-- `selftest`: the checker on known BWTs and planted errors, and the GPU construction on adversarial inputs, verified by the checker (GPU cases skipped without a device).
+- `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 20) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 17) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 8, 1 to 16) the symbol contexts.
+- `selftest`: the checker on known BWTs and planted errors, and codec round trips over several parameter sets and the rejection of truncated input, and the GPU construction on adversarial inputs, verified by the checker (GPU cases skipped without a device).
 
 ## From sadcs
 
@@ -79,9 +82,10 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 ## Where things live
 
 - `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead.
+- `src/codec/`: the format (`format.h`, shared by CPU and GPU) and the CPU reference codec.
 - `src/common/`: the BWT checker and file I/O.
 - `src/cli/`: the command line and the selftest.
-- `docs/`: the design records, starting with [handoff.md](docs/handoff.md).
+- `docs/`: the design records, starting with [handoff.md](docs/handoff.md), and the [format](docs/format.md).
 
 ## License
 

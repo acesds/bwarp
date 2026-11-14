@@ -1,7 +1,7 @@
 /*
  * selftest.cpp - The checker on known BWTs, then the GPU construction verified by the checker.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.
  * https://opensource.org/licenses/MIT
@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include "checker.h"
+#include "cpucodec.h"
 #include "gpubwarp.h"
 
 namespace {
@@ -159,6 +160,71 @@ namespace {
         }
     }
 
+    // ---- codec ---------------------------------------------------------------------------------
+
+    void testCodec(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, const EncodeParams& params) {
+        const int32_t n = static_cast<int32_t>(input.size());
+        const std::string label = name + " (2^" + std::to_string(params.logSegment) + ", 2^" +
+                                  std::to_string(params.logSlice) + ", " + std::to_string(params.contexts) + ")";
+        std::vector<uint8_t> encoded, decoded;
+        int32_t primary = -1;
+
+        suite.cases++;
+
+        if (!encodeBwt(input.data(), n, 12345, params, encoded)) {
+            suite.reportFailure(label, "encoder refused", -1);
+            return;
+        }
+
+        if (!decodeBwt(encoded.data(), encoded.size(), decoded, primary) || primary != 12345 || decoded != input) {
+            suite.reportFailure(label, "round trip differs", -1);
+            return;
+        }
+
+        // Every truncation must be refused.
+        suite.cases++;
+
+        for (size_t size = 0; size < encoded.size(); size += std::max<size_t>(1, encoded.size() / 97)) {
+            if (decodeBwt(encoded.data(), size, decoded, primary)) {
+                suite.reportFailure(label + ", truncated", "not refused", static_cast<int64_t>(size));
+                return;
+            }
+        }
+
+        if (suite.verbose) {
+            printf("  ok   %s, %zu -> %zu bytes\n", label.c_str(), input.size(), encoded.size());
+        }
+    }
+
+    void runCodecCases(Suite& suite) {
+        const EncodeParams paramSets[] = {{20, 15, 8}, {10, 10, 1}, {12, 10, 4}, {17, 17, 16}, {24, 12, 2}};
+        Rng rng{5};
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> inputs = {
+            {"\"\"", {}},
+            {"\"a\"", textOf("a")},
+            {"\"mississippi\"", textOf("mississippi")},
+            {"run of 0xff", std::vector<uint8_t>(300000, 0xff)},
+            {"random sigma=2", randomText(rng, 100000, 2)},
+            {"random sigma=256", randomText(rng, 100000, 256)},
+            {"period 7", periodicText(rng, 70001, 7)},
+        };
+
+        // Runs of random lengths up to 5000, longer than a lane at small slices.
+        std::vector<uint8_t> runs;
+
+        while (runs.size() < 400000) {
+            runs.insert(runs.end(), 1 + rng.nextBelow(rng.nextBelow(2) ? 8 : 5000), static_cast<uint8_t>(rng.nextBelow(6)));
+        }
+
+        inputs.push_back({"random runs", runs});
+
+        for (const EncodeParams& params : paramSets) {
+            for (const auto& [name, input] : inputs) {
+                testCodec(suite, name, input, params);
+            }
+        }
+    }
+
     // ---- GPU -----------------------------------------------------------------------------------
 
     void testGpu(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, GpuBwtContext* context = nullptr) {
@@ -276,6 +342,8 @@ int runSelfTest(bool verbose) {
 
     printf("selftest: checker on known BWTs and planted errors...\n");
     runCheckerCases(suite);
+    printf("selftest: codec round trips and truncations...\n");
+    runCodecCases(suite);
     runGpuCases(suite);
 
     printf("selftest: %d of %d cases passed\n", suite.cases - suite.failures, suite.cases);

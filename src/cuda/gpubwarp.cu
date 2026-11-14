@@ -3,7 +3,7 @@
  *
  * The BWT construction is from sadcs (https://github.com/acesds/sadcs), BWT path only.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.
  * https://opensource.org/licenses/MIT

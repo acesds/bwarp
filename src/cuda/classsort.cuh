@@ -6,7 +6,7 @@
  * with n prepended, so that suffix n - 1 sorts first among those starting with T[n - 1].
  * Keys hold T[q] to T[q - 3]; the next class shifts them, so only classes 1 and 5 read the text.
  *
- * Part of bwarp, a GPU entropy coder and inverse transform for BWT output.
+ * Part of bwarp, a GPU-based BWT file compressor.
  * From sadcs (https://github.com/acesds/sadcs), BWT path only.
  * Copyright (c) 2026 Alex Schumacher
  * Licensed under the MIT License; see the LICENSE file for details.
