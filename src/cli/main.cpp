@@ -1005,7 +1005,7 @@ namespace {
             std::filesystem::create_directories(job.out.parent_path(), error);
         }
 
-        if (!writeWholeFile(job.out.string().c_str(), data, size)) {
+        if (!writeFileDirect(job.out.string().c_str(), data, size)) {
             printf("bwarp: cannot write '%s'\n", job.out.string().c_str());
             return false;
         }
@@ -1018,7 +1018,7 @@ namespace {
         int64_t out = 0;
         double readWait = 0.0;  // waiting for the reader
         double gpu = 0.0;       // the (de)compression calls, host to host
-        double write = 0.0;
+        double write = 0.0;     // writing, or waiting for the writer
     };
 
     // Reads job i into buffers[i % 2] on another thread while process(i) runs on the one before. process(i) is
@@ -1071,7 +1071,7 @@ namespace {
         }
 
         printf("%s %zu file%s in %.1f ms (%.1f MB/s with reading and writing; setup %.1f ms before): GPU %.1f ms, "
-               "waiting to read %.1f ms, writing %.1f ms\n",
+               "waiting to read %.1f ms, to write %.1f ms\n",
             verb, files, files == 1 ? "" : "s", 1e3 * wall, megabytesPerSecond(text, wall), 1e3 * setup, 1e3 * t.gpu,
             1e3 * t.readWait, 1e3 * t.write);
     }
@@ -1192,18 +1192,16 @@ namespace {
             largestText = std::max(largestText, job.n);
         }
 
-        PinnedBuffer buffers[2], text;
+        // Two of each: file i is read while i - 1 is decompressed, which is written while i is decompressed.
+        PinnedBuffer buffers[2], texts[2];
 
         for (size_t b = 0; b < std::min<size_t>(2, jobs.size()); b++) {
-            if (!buffers[b].allocate(static_cast<size_t>(largestIn))) {
-                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largestIn));
+            if (!buffers[b].allocate(static_cast<size_t>(largestIn)) ||
+                !texts[b].allocate(static_cast<size_t>(largestText))) {
+                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n",
+                    static_cast<long long>(largestIn + largestText));
                 return kExitError;
             }
-        }
-
-        if (!text.allocate(static_cast<size_t>(largestText))) {
-            printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largestText));
-            return kExitError;
         }
 
         const double setup = secondsSince(start);
@@ -1213,14 +1211,28 @@ namespace {
 
         CodingTotals totals;
         int64_t textBytes = 0;
+        std::future<bool> written;  // the file before, from the other text buffer
+        const auto waitForWrite = [&] {
+            if (!written.valid()) {
+                return true;
+            }
+
+            const auto phase = std::chrono::steady_clock::now();
+            const bool writeOk = written.get();
+
+            totals.write += secondsSince(phase);
+
+            return writeOk;
+        };
 
         start = std::chrono::steady_clock::now();
 
-        const bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
+        bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
             const FileJob& job = jobs[i];
+            PinnedBuffer& text = texts[i % 2];  // file i - 2's, written before file i - 1's write started
             size_t n = 0;
             GpuDecodeStats stats;
-            auto phase = std::chrono::steady_clock::now();
+            const auto phase = std::chrono::steady_clock::now();
             const GpuStatus status = gpuDecompress(buffers[i % 2].data(), static_cast<size_t>(job.size), text.data(),
                 text.capacity(), n, &stats);
             const double seconds = secondsSince(phase);
@@ -1232,13 +1244,12 @@ namespace {
             }
 
             totals.gpu += seconds;
-            phase = std::chrono::steady_clock::now();
 
-            if (!writeOutput(job, text.data(), n)) {
+            if (!waitForWrite()) {
                 return false;
             }
 
-            totals.write += secondsSince(phase);
+            written = std::async(std::launch::async, [&job, &text, n] { return writeOutput(job, text.data(), n); });
             totals.in += job.size;
             totals.out += static_cast<int64_t>(n);
             textBytes += static_cast<int64_t>(n);
@@ -1256,6 +1267,7 @@ namespace {
             return true;
         });
 
+        ok = waitForWrite() && ok;
         printCodingTotals("decompressed", nameWidth, jobs.size(), totals, textBytes, setup, secondsSince(start));
 
         return ok ? kExitOk : kExitError;

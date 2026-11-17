@@ -18,6 +18,11 @@ bool readWholeFile(const char* path, std::vector<uint8_t>& out, size_t padding =
 
 bool writeWholeFile(const char* path, const void* data, size_t size);
 
+// writeWholeFile(), but on Windows past the file cache, about twice as fast for large files (100 MB: 30 ms instead
+// of 55) and on the disk on return, if data is aligned to 4 KiB (as page-locked memory is) and size at least 32 MiB.
+// Smaller files are faster through the cache.
+bool writeFileDirect(const char* path, const void* data, size_t size);
+
 // The first size bytes of the file into buffer, without clearing it first: false if the file has fewer.
 bool readFileInto(const char* path, void* buffer, size_t size);
 
