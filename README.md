@@ -90,7 +90,8 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 - `src/codec/`: the format (`format.h`), table coding (`table.h`) and container (`container.h`), shared by CPU and GPU, and the CPU reference codec.
 - `src/common/`: the BWT checker, CRC-32C (SSE4.2, on several threads for large inputs) and file I/O.
 - `src/cli/`: the command line and the selftest.
-- `docs/`: the design records, starting with [handoff.md](docs/handoff.md), and the [format](docs/format.md).
+- `docs/`: the design records, starting with [handoff.md](docs/handoff.md), the [format](docs/format.md), and the [Large Text Compression Benchmark figures](docs/ltcb.md).
+- `tools/`: `ltcb.ps1`, which measures those figures.
 
 ## License
 
