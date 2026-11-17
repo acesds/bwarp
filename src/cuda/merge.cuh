@@ -415,19 +415,42 @@ namespace gpusa {
         // Read with the records; the output loop visits the same elements. capacity <= kMergePerThread * threads.
         uint8_t before[kMergePerThread];
 
-        for (uint32_t e = threadIdx.x, k = 0; e < size; e += blockDim.x, k++) {
-            int l = 0;
+        {
+            // All list reads first, then all text and rank reads, so that a thread's loads are in flight together.
+            uint32_t p[kMergePerThread];
+            MergeRecord loaded[kMergePerThread];
 
-            while (e >= info.segment[l + 1]) {
-                l++;
+#pragma unroll
+            for (uint32_t k = 0; k < kMergePerThread; k++) {
+                const uint32_t e = threadIdx.x + k * blockDim.x;
+
+                if (e < size) {
+                    int l = 0;
+
+                    while (e >= info.segment[l + 1]) {
+                        l++;
+                    }
+
+                    p[k] = in.lists[info.source[l] + e - info.segment[l]];
+                }
             }
 
-            const uint32_t p = in.lists[info.source[l] + e - info.segment[l]];
+#pragma unroll
+            for (uint32_t k = 0; k < kMergePerThread; k++) {
+                if (threadIdx.x + k * blockDim.x < size) {
+                    loadRecord(in, p[k], loaded[k]);
 
-            loadRecord(in, p, records[e]);
+                    if constexpr (kOut == MergeOutput::Bwt) {
+                        before[k] = characterBefore(in, p[k]);
+                    }
+                }
+            }
 
-            if constexpr (kOut == MergeOutput::Bwt) {
-                before[k] = characterBefore(in, p);
+#pragma unroll
+            for (uint32_t k = 0; k < kMergePerThread; k++) {
+                if (const uint32_t e = threadIdx.x + k * blockDim.x; e < size) {
+                    records[e] = loaded[k];
+                }
             }
         }
 
@@ -777,7 +800,6 @@ namespace gpusa {
                 in, m_rows, out, m_params.capacity, m_overflowCount, m_overflow, m_overflowCount + 1);
             mergeOverflow<kOut><<<sms * 2, m_params.overflowThreads, overflowShared>>>(
                 in, m_rows, out, m_params.overflowCapacity, m_overflowCount, m_overflow, m_overflowCount + 1);
-
             return cudaSuccess;
         }
 
