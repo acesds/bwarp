@@ -19,6 +19,7 @@ struct EncodeParams {
     int logSlice = 15;    // one 32-lane rANS stream per 2^logSlice bytes
     int contexts = 16;    // at most; each segment's table picks its own
     int logSample = 0;    // the inverse BWT's chains start every 2^logSample text positions; 0: chooseLogSample()
+    bool lastBlock = true;  // the file's last block: its header says so
 };
 
 // The automatic sample interval: the smallest 2^k, k in [10, 16], with at most 2^13 chains or whose samples

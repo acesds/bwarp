@@ -113,13 +113,14 @@ namespace bwarp {
         Layout layout;
         uint32_t primary = 0;
         uint32_t checksum = 0;
+        bool last = false;  // the file's last block
     };
 
     // The fixed kHeaderBytes at a block's start: false unless they are valid. Its index ends at
     // layout.indexBytes(), with the block's size, the last slice offset, in its last 8 bytes.
     inline bool readBlockHeader(const uint8_t* data, BlockHeader& header) {
-        if (get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt || data[9] != 0 ||
-            data[10] != 0 || data[11] != 0) {
+        if (get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt ||
+            (data[9] & ~kFlagLastBlock) != 0 || data[10] != 0 || data[11] != 0) {
             return false;
         }
 
@@ -128,6 +129,7 @@ namespace bwarp {
 
         header.primary = get32(data + 16);
         header.checksum = get32(data + 20);
+        header.last = (data[9] & kFlagLastBlock) != 0;
 
         if (!validParams(logSegment, logSlice, 1, logSample) || n > kMaxBlockBytes || !validRow(header.primary, n)) {
             return false;

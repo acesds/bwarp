@@ -12,7 +12,8 @@ A bwarp file is a series of blocks, one after another with nothing between, each
 | 1 | logSegment, logSlice ≤ logSegment ≤ 24 |
 | 1 | logSlice, 10 to 16 |
 | 1 | logSample, 8 to 31 |
-| 3 | zero |
+| 1 | flags: bit 0 set on the file's last block, the other bits zero |
+| 2 | zero |
 | 4 | n, the block's text length, at most 2^30 |
 | 4 | primary, the sentinel's row among the sorted rotations |
 | 4 | checksum, the CRC-32C (Castagnoli, as in iSCSI; of "123456789", 0xE3069283) of the block's text |
@@ -30,7 +31,7 @@ bwarp's encoder picks the smallest logSample in [10, 16] that gives at most 2^13
 
 It is cut into slices of 2^logSlice bytes and segments of 2^logSegment bytes (the last of each may be shorter): `slices = ceil(n / 2^logSlice)`, `segments = ceil(n / 2^logSegment)`. Segment g's table models slices [g × 2^(logSegment − logSlice), …).
 
-Offsets count from the block's start. Table g occupies [segment offset g, g + 1), stream s [slice offset s, s + 1). The first segment offset is the end of the slice offsets, the last equals the first slice offset, and the last slice offset is the block's size: the next block starts there. A reader finds the blocks from their first 24 bytes, which give the index's size, and the 8 bytes that end it.
+Offsets count from the block's start. Table g occupies [segment offset g, g + 1), stream s [slice offset s, s + 1). The first segment offset is the end of the slice offsets, the last equals the first slice offset, and the last slice offset is the block's size: the next block starts there. A reader finds the blocks from their first 24 bytes, which give the index's size, and the 8 bytes that end it. Exactly one block, the last, has the last-block flag: a file that ends before it is truncated, and one with bytes after it is corrupt.
 
 The checksum is checked after the inverse BWT: a mismatch means the data is corrupt.
 

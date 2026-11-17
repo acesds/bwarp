@@ -552,6 +552,7 @@ void writeIndex(int32_t n, int32_t primary, uint32_t checksum, const uint32_t* s
     out[6] = static_cast<uint8_t>(params.logSegment);
     out[7] = static_cast<uint8_t>(params.logSlice);
     out[8] = static_cast<uint8_t>(logSample);
+    out[9] = params.lastBlock ? kFlagLastBlock : 0;
     put32(&out[12], layout.n);
     put32(&out[16], static_cast<uint32_t>(primary));
     put32(&out[20], checksum);

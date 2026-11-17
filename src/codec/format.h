@@ -26,6 +26,7 @@ namespace bwarp {
     constexpr uint8_t kVersion = 0;
     constexpr uint8_t kTransformBwt = 0;
     constexpr int kHeaderBytes = 24;
+    constexpr uint8_t kFlagLastBlock = 1;  // header byte 9; the other bits are zero
     constexpr uint32_t kMaxLogBlock = 30;
     constexpr uint32_t kMaxBlockBytes = 1u << kMaxLogBlock;  // a file is a series of blocks of at most 1 GiB
 

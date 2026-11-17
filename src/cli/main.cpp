@@ -1085,9 +1085,17 @@ namespace {
                     return false;
                 }
 
+                // Only the last block has the flag, so whole blocks missing at the end are caught too.
+                if (parsed.last != (size == left)) {
+                    printf(parsed.last ? "bwarp: '%s' is corrupt: data after its last block, block %d\n"
+                                       : "bwarp: '%s' is truncated: it ends after block %d, without its last\n",
+                        path.c_str(), block.index);
+                    return false;
+                }
+
                 block.size = static_cast<int64_t>(size);
                 block.n = parsed.layout.n;
-                block.last = size == left;
+                block.last = parsed.last;
                 job.text += block.n;
                 blocks.push_back(block);
                 block.offset += block.size;
@@ -1322,9 +1330,13 @@ namespace {
             const uint8_t* compressed = nullptr;
             size_t size = 0;
             GpuCompressStats stats;
+            EncodeParams blockParams = params;
+
+            blockParams.lastBlock = block.last;
+
             const auto phase = std::chrono::steady_clock::now();
             const GpuStatus status = gpuCompress(context.get(), buffers[i % 2].data(), static_cast<int32_t>(block.size),
-                params, compressed, size, nullptr, &stats);
+                blockParams, compressed, size, nullptr, &stats);
             const double seconds = secondsSince(phase);
 
             if (status != GpuStatus::Ok) {

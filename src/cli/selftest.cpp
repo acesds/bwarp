@@ -504,13 +504,25 @@ namespace {
                 suite.reportFailure("commands, wrong checksum", "not refused, or the output left", -1);
             }
 
-            suite.cases++;
-            bytes.pop_back();
+            // Cut by a byte, at the end of the first block, and with a whole file after its last block.
+            std::vector<uint8_t> appended = bytes;
 
-            if (!writeWholeFile(broken.string().c_str(), bytes.data(), bytes.size()) ||
-                runArgs(command, {"decompress", broken.string(), result.string(), "--quiet", "--force"}) ||
-                fs::exists(result)) {
-                suite.reportFailure("commands, truncated", "not refused, or the output left", -1);
+            appended.insert(appended.end(), bytes.begin(), bytes.end());
+
+            const std::pair<const char*, std::vector<uint8_t>> brokenFiles[] = {
+                {"commands, truncated by a byte", std::vector<uint8_t>(bytes.begin(), bytes.end() - 1)},
+                {"commands, truncated after a block", std::vector<uint8_t>(bytes.begin(), bytes.begin() + second)},
+                {"commands, bytes after the last block", appended},
+            };
+
+            for (const auto& [label, contents] : brokenFiles) {
+                suite.cases++;
+
+                if (!writeWholeFile(broken.string().c_str(), contents.data(), contents.size()) ||
+                    runArgs(command, {"decompress", broken.string(), result.string(), "--quiet", "--force"}) ||
+                    fs::exists(result)) {
+                    suite.reportFailure(label, "not refused, or the output left", -1);
+                }
             }
         }
 
