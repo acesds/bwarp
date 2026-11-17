@@ -196,8 +196,14 @@ namespace bwarp::gpu {
         }
     };
 
-    // codeRow()'s cost in one part, by a warp.
-    __device__ void costRowPart(LaneCells& cells, const uint32_t* __restrict__ cost, bool used, const uint16_t* q,
+    // A row's q held as an array.
+    __device__ __forceinline__ auto arrayQ(const uint16_t* q) {
+        return [q](uint32_t i) { return uint32_t(q[i]); };
+    }
+
+    // codeRow()'s cost in one part, by a warp. q(i): the row's entry i.
+    template <class Q>
+    __device__ void costRowPart(LaneCells& cells, const uint32_t* __restrict__ cost, bool used, Q q,
         const uint8_t* predicted, uint32_t size, uint32_t skip, uint32_t part, uint32_t lane) {
         cells.code(cost, cells.used, part == 1 && lane == 0, used);
 
@@ -210,7 +216,7 @@ namespace bwarp::gpu {
         for (uint32_t at = 0; at < size; at += 32) {
             const uint32_t i = at + lane;
             const bool valid = i < size && i != skip;
-            const uint32_t pq = valid ? predicted[i] : 0, qi = valid ? q[i] : 0;
+            const uint32_t pq = valid ? predicted[i] : 0, qi = valid ? q(i) : 0;
 
             if (part < kZeroParts) {
                 const uint32_t zeroContext = min(pq, kZeroContexts - 1);
@@ -262,15 +268,40 @@ namespace bwarp::gpu {
         }
     }
 
+    // Per fine context c and rank, the tokens in contexts c and above; the last row stays zero. Packed, ranks r and
+    // r + 128 share a word, r in the low half: exact while no rank has 2^16 tokens in a segment, so for segments of
+    // up to 2^16 bytes (a slice's lanes are longer than a byte, so not every byte can start a run).
+    template <bool Packed>
+    struct SuffixCounts {
+        static constexpr uint32_t kWords = Packed ? 128 : 256;
+        static constexpr uint32_t kRows = kFineContexts + 1;
+        static constexpr uint32_t kZeroRow = kFineContexts;
+
+        uint32_t words[kRows][kWords];
+
+        __device__ __forceinline__ void add(uint32_t c, uint32_t r) {
+            atomicAdd(&words[c][Packed ? r % 128 : r], Packed ? 1u << (r / 128 * 16) : 1u);
+        }
+
+        __device__ __forceinline__ uint32_t get(uint32_t c, uint32_t r) const {
+            return Packed ? (words[c][r % 128] >> (r / 128 * 16)) & 0xffff : words[c][r];
+        }
+
+        // Tokens in contexts [c, d).
+        __device__ __forceinline__ uint32_t tokens(uint32_t c, uint32_t d, uint32_t r) const {
+            return get(c, r) - get(d, r);
+        }
+    };
+
     // Rows c < K - 1 are the same for every K, so they are coded once, in order, and each K adds its last row: the
     // merged contexts K - 1 and above. Likewise for length rows. Arrays by K are indexed by log2 K, by length
-    // context count by its log2.
+    // context count by its log2. The shared symbol rows' q are not kept but quantized from suffix when needed.
+    template <bool Packed>
     struct ChooseShared {
         uint32_t tokens[256];  // per byte
         uint32_t lengthTotal[kMaxLengthCodes];
-        // Per fine context c and rank, the tokens in contexts c and above; the last row stays zero. The same for
-        // length contexts by min(rank, 3).
-        uint32_t suffix[kFineContexts + 1][256];
+        SuffixCounts<Packed> suffix;
+        // The same for length contexts by min(rank, 3).
         uint32_t lengthSuffix[kMaxLengthContexts + 1][kMaxLengthCodes];
         uint16_t byteQ[256];
         uint16_t mergedQ[kContextChoices][256];
@@ -301,15 +332,10 @@ namespace bwarp::gpu {
         RowCost counts;  // K, m and the count lists
         uint32_t alphabet;
         uint32_t winner;  // log2 K of this m's best so far, or UINT32_MAX
-        __align__(16) uint8_t table[sizeof(TableData)];  // with the shared rows
+        TableHead table;  // with the shared length rows
         __align__(16) uint8_t snapshots[sizeof(RowModels) * (kContextChoices + kLengthChoices)];  // the models before
                                                                                                     // each last row
     };
-
-    // Quantized tokens in contexts [c, c + 1) or, merged, [c, ...): hi = row c, lo = row c + 1 or the zero row.
-    __device__ __forceinline__ uint32_t rowQ(const uint32_t* hi, const uint32_t* lo, uint32_t i, uint32_t m) {
-        return quantizeCount(hi[i] - lo[i], m);
-    }
 
     __device__ __forceinline__ uint64_t warpSum(uint64_t v) {
         for (uint32_t d = 16; d > 0; d /= 2) {
@@ -319,11 +345,12 @@ namespace bwarp::gpu {
         return v;
     }
 
-    // The stream cost of a row of size entries with counts hi - lo, coded with the frequencies of q, by a warp:
-    // normalizeFrequencies() with lane j holding entries j, j + 32, ... The rounding error goes to the largest
+    // The stream cost of a row of size entries with count(i) tokens, coded with the frequencies of its q(i), by a
+    // warp: normalizeFrequencies() with lane j holding entries j, j + 32, ... The rounding error goes to the largest
     // frequency, the first of equals, as there. The cost in every lane.
-    __device__ uint64_t streamBits(const uint16_t* q, uint32_t size, bool used, const uint32_t* hi, const uint32_t* lo,
-        uint32_t m, const uint32_t* __restrict__ cost, uint32_t lane) {
+    template <class Q, class Count>
+    __device__ uint64_t streamBits(Q q, uint32_t size, bool used, Count count, uint32_t m,
+        const uint32_t* __restrict__ cost, uint32_t lane) {
         if (!used) {
             return 0;
         }
@@ -335,7 +362,7 @@ namespace bwarp::gpu {
 #pragma unroll
         for (uint32_t j = 0; j < kPerLane; j++) {
             const uint32_t i = lane + 32 * j;
-            counts[j] = i < size ? dequantizeCount(q[i], m) : 0;
+            counts[j] = i < size ? dequantizeCount(q(i), m) : 0;
             total += counts[j];
         }
 
@@ -391,7 +418,7 @@ namespace bwarp::gpu {
             const uint32_t i = lane + 32 * j;
 
             if (i < size) {
-                bits += uint64_t(hi[i] - lo[i]) * __ldg(cost + freqs[j]);
+                bits += uint64_t(count(i)) * __ldg(cost + freqs[j]);
             }
         }
 
@@ -419,13 +446,16 @@ namespace bwarp::gpu {
     }
 
     // A block per segment: chooseModel() of the CPU encoder. Leaves the winner in tables[g] and the number of its
-    // table's decisions in decisions[g]. cost: encodingCosts().
-    __global__ void __launch_bounds__(kChooseThreads, 2) chooseTables(const uint8_t* __restrict__ bwt, uint32_t n,
-        int logSegment, int logSlice, uint32_t maxContexts, const uint32_t* __restrict__ cost, TableData* tables,
-        uint64_t* decisions) {
-        __shared__ ChooseShared s;
+    // table's decisions in decisions[g]. cost: encodingCosts(). Packed: segments of at most 2^16 bytes, which
+    // leaves room for three blocks per SM.
+    template <bool Packed>
+    __global__ void __launch_bounds__(kChooseThreads, Packed ? 3 : 2) chooseTables(const uint8_t* __restrict__ bwt,
+        uint32_t n, int logSegment, int logSlice, uint32_t maxContexts, const uint32_t* __restrict__ cost,
+        TableData* tables, uint64_t* decisions) {
+        using Suffix = SuffixCounts<Packed>;
+        __shared__ ChooseShared<Packed> s;
 
-        TableData& table = *reinterpret_cast<TableData*>(s.table);
+        TableHead& table = s.table;
         const uint32_t g = blockIdx.x, tid = threadIdx.x;
         const uint32_t slices = (n + (1u << logSlice) - 1) >> logSlice;
         const uint32_t first = g << (logSegment - logSlice);
@@ -465,8 +495,8 @@ namespace bwarp::gpu {
                 s.byteQ[b] = static_cast<uint16_t>(quantizeCount(s.tokens[b], m));
             }
 
-            for (uint32_t e = tid; e < (kFineContexts + 1) * 256; e += kChooseThreads) {
-                (&s.suffix[0][0])[e] = 0;
+            for (uint32_t e = tid; e < Suffix::kRows * Suffix::kWords; e += kChooseThreads) {
+                (&s.suffix.words[0][0])[e] = 0;
             }
 
             for (uint32_t e = tid; e < (kMaxLengthContexts + 1) * kMaxLengthCodes; e += kChooseThreads) {
@@ -503,7 +533,7 @@ namespace bwarp::gpu {
             forEachRun(
                 bwt, n, logSlice, first, end, [&](uint32_t byte) { return uint32_t(table.rankOf[byte]); },
                 [&](uint32_t rank, bool laneStart, uint32_t previous) {
-                    atomicAdd(&s.suffix[laneStart ? kMaxContexts : min(previous, kMaxContexts - 1)][rank], 1u);
+                    s.suffix.add(laneStart ? kMaxContexts : min(previous, kMaxContexts - 1), rank);
                 },
                 [&](uint32_t rank, uint32_t length) {
                     atomicAdd(&s.lengthSuffix[min(rank, kMaxLengthContexts - 1)][lengthCode(length).code], 1u);
@@ -511,10 +541,11 @@ namespace bwarp::gpu {
 
             __syncthreads();
 
-            for (uint32_t r = tid; r < 256; r += kChooseThreads) {
+            // Packed, both halves at once: neither carries.
+            for (uint32_t w = tid; w < Suffix::kWords; w += kChooseThreads) {
                 for (uint32_t c = kFineContexts - 1, sum = 0; c != UINT32_MAX; c--) {
-                    sum += s.suffix[c][r];
-                    s.suffix[c][r] = sum;
+                    sum += s.suffix.words[c][w];
+                    s.suffix.words[c][w] = sum;
                 }
             }
 
@@ -528,8 +559,6 @@ namespace bwarp::gpu {
             __syncthreads();
 
             const uint32_t alphabet = s.alphabet;
-            const uint32_t* zero = s.suffix[kFineContexts];
-            const uint32_t* lengthZero = s.lengthSuffix[kMaxLengthContexts];
 
             for (uint32_t b = tid; b < 256; b += kChooseThreads) {
                 table.byteQ[b] = s.byteQ[b];
@@ -543,24 +572,29 @@ namespace bwarp::gpu {
                 s.lengthCount[l] = dequantizeCount(q, m);
             }
 
-            for (uint32_t e = tid; e < fineRows * alphabet; e += kChooseThreads) {
-                const uint32_t c = e / alphabet, r = e % alphabet;
-                table.symbolQ[c][r] = static_cast<uint16_t>(rowQ(s.suffix[c], s.suffix[c + 1], r, m));
-            }
+            // Quantized tokens of shared symbol row c, by rank; tokens in length contexts [c, d).
+            const auto fineQ = [m](uint32_t c) {
+                return [c, m](uint32_t i) { return quantizeCount(s.suffix.tokens(c, c + 1, i), m); };
+            };
+            const auto lengthTokens = [](uint32_t c, uint32_t d, uint32_t l) {
+                return s.lengthSuffix[c][l] - s.lengthSuffix[d][l];
+            };
 
             for (uint32_t e = tid; e < choices * alphabet; e += kChooseThreads) {
                 const uint32_t ki = e / alphabet, r = e % alphabet;
-                s.mergedQ[ki][r] = static_cast<uint16_t>(rowQ(s.suffix[(1u << ki) - 1], zero, r, m));
+                s.mergedQ[ki][r] =
+                    static_cast<uint16_t>(quantizeCount(s.suffix.tokens((1u << ki) - 1, Suffix::kZeroRow, r), m));
             }
 
             for (uint32_t e = tid; e < fineLengthRows * lengthCodes; e += kChooseThreads) {
                 const uint32_t c = e / lengthCodes, l = e % lengthCodes;
-                table.lengthQ[c][l] = static_cast<uint16_t>(rowQ(s.lengthSuffix[c], s.lengthSuffix[c + 1], l, m));
+                table.lengthQ[c][l] = static_cast<uint16_t>(quantizeCount(lengthTokens(c, c + 1, l), m));
             }
 
             for (uint32_t e = tid; e < lengthChoices * lengthCodes; e += kChooseThreads) {
                 const uint32_t li = e / lengthCodes, l = e % lengthCodes;
-                s.mergedLengthQ[li][l] = static_cast<uint16_t>(rowQ(s.lengthSuffix[(1u << li) - 1], lengthZero, l, m));
+                s.mergedLengthQ[li][l] =
+                    static_cast<uint16_t>(quantizeCount(lengthTokens((1u << li) - 1, kMaxLengthContexts, l), m));
             }
 
             if (tid == 0) {
@@ -584,8 +618,8 @@ namespace bwarp::gpu {
             if (uint32_t job = tid; job < fineRows) {
                 bool used = false;
 
-                for (uint32_t r = 0; r < alphabet; r++) {
-                    used = used || table.symbolQ[job][r] > 0;
+                for (uint32_t r = 0; r < alphabet && !used; r++) {
+                    used = fineQ(job)(r) > 0;
                 }
 
                 table.symbolUsed[job] = used;
@@ -675,21 +709,23 @@ namespace bwarp::gpu {
 
                 if (uint32_t at = job; at < fineRows) {
                     to = &s.rowBits[at];
-                    bits = streamBits(table.symbolQ[at], alphabet, table.symbolUsed[at], s.suffix[at],
-                        s.suffix[at + 1], m, cost, lane);
+                    bits = streamBits(fineQ(at), alphabet, table.symbolUsed[at],
+                        [at](uint32_t i) { return s.suffix.tokens(at, at + 1, i); }, m, cost, lane);
                 } else if ((at -= fineRows) < choices) {
                     to = &s.mergedBits[at];
-                    bits = streamBits(s.mergedQ[at], alphabet, s.mergedUsed[at], s.suffix[(1u << at) - 1], zero, m,
+                    bits = streamBits(arrayQ(s.mergedQ[at]), alphabet, s.mergedUsed[at],
+                        [at](uint32_t i) { return s.suffix.tokens((1u << at) - 1, Suffix::kZeroRow, i); }, m,
                         cost, lane);
                 } else if ((at -= choices) < fineLengthRows) {
                     to = &s.lengthRowBits[at];
-                    bits = streamBits(table.lengthQ[at], lengthCodes, table.lengthUsed[at], s.lengthSuffix[at],
-                        s.lengthSuffix[at + 1], m, cost, lane);
+                    bits = streamBits(arrayQ(table.lengthQ[at]), lengthCodes, table.lengthUsed[at],
+                        [&, at](uint32_t l) { return lengthTokens(at, at + 1, l); }, m, cost, lane);
                 } else {
                     at -= fineLengthRows;
                     to = &s.mergedLengthBits[at];
-                    bits = streamBits(s.mergedLengthQ[at], lengthCodes, s.mergedLengthUsed[at],
-                        s.lengthSuffix[(1u << at) - 1], lengthZero, m, cost, lane);
+                    bits = streamBits(arrayQ(s.mergedLengthQ[at]), lengthCodes, s.mergedLengthUsed[at],
+                        [&, at](uint32_t l) { return lengthTokens((1u << at) - 1, kMaxLengthContexts, l); }, m,
+                        cost, lane);
                 }
 
                 if (lane == 0) {
@@ -707,11 +743,11 @@ namespace bwarp::gpu {
                 cells.load(snapshots[symbol ? ki : kContextChoices + ki], part, lane);
 
                 if (symbol) {
-                    costRowPart(cells, cost, s.mergedUsed[ki], s.mergedQ[ki], s.mergedPredicted[ki], alphabet, 256,
-                        part, lane);
+                    costRowPart(cells, cost, s.mergedUsed[ki], arrayQ(s.mergedQ[ki]), s.mergedPredicted[ki], alphabet,
+                        256, part, lane);
                 } else {
-                    costRowPart(cells, cost, s.mergedLengthUsed[ki], s.mergedLengthQ[ki], s.mergedLengthPredicted[ki],
-                        lengthCodes, kMaxLengthCodes, part, lane);
+                    costRowPart(cells, cost, s.mergedLengthUsed[ki], arrayQ(s.mergedLengthQ[ki]),
+                        s.mergedLengthPredicted[ki], lengthCodes, kMaxLengthCodes, part, lane);
                 }
 
                 const uint32_t bits = __reduce_add_sync(~0u, cells.bits);
@@ -734,7 +770,6 @@ namespace bwarp::gpu {
                     const bool symbol = kind == 0;
                     const uint32_t rows = symbol ? fineRows : fineLengthRows, last = symbol ? choices : lengthChoices;
                     const uint32_t size = symbol ? alphabet : lengthCodes, stride = symbol ? 256 : kMaxLengthCodes;
-                    const uint16_t* q = symbol ? table.symbolQ[0] : table.lengthQ[0];
                     const uint8_t* predicted = symbol ? s.predicted[0] : s.lengthPredicted[0];
                     const bool* used = symbol ? table.symbolUsed : table.lengthUsed;
                     RowModels* snapshot = snapshots + (symbol ? 0 : kContextChoices);
@@ -759,8 +794,12 @@ namespace bwarp::gpu {
                             break;
                         }
 
-                        costRowPart(cells, cost, used[c], q + c * stride, predicted + c * stride, size,
-                            symbol ? c : kMaxLengthCodes, part, lane);
+                        if (symbol) {
+                            costRowPart(cells, cost, used[c], fineQ(c), predicted + c * stride, size, c, part, lane);
+                        } else {
+                            costRowPart(cells, cost, used[c], arrayQ(table.lengthQ[c]), predicted + c * stride, size,
+                                kMaxLengthCodes, part, lane);
+                        }
                     }
                 }
 
@@ -836,17 +875,21 @@ namespace bwarp::gpu {
             if (const uint32_t ki = s.winner; ki != UINT32_MAX) {
                 const uint32_t k = 1u << ki, kl = lengthContexts(k), li = ki < lengthChoices ? ki : lengthChoices - 1;
                 const uint32_t* from = reinterpret_cast<const uint32_t*>(&table);
-                uint32_t* to = reinterpret_cast<uint32_t*>(tables + g);
                 TableData& out = tables[g];
+                uint32_t* to = reinterpret_cast<uint32_t*>(static_cast<TableHead*>(&out));
 
-                for (uint32_t i = tid; i < sizeof(TableData) / 4; i += kChooseThreads) {
+                static_assert(sizeof(TableHead) % 4 == 0);
+
+                for (uint32_t i = tid; i < sizeof(TableHead) / 4; i += kChooseThreads) {
                     to[i] = from[i];
                 }
 
                 __syncthreads();
 
-                for (uint32_t r = tid; r < alphabet; r += kChooseThreads) {
-                    out.symbolQ[k - 1][r] = s.mergedQ[ki][r];
+                // The symbol rows: the shared ones quantized from the counts, then the merged last one.
+                for (uint32_t e = tid; e < k * alphabet; e += kChooseThreads) {
+                    const uint32_t c = e / alphabet, r = e % alphabet;
+                    out.symbolQ[c][r] = c < k - 1 ? static_cast<uint16_t>(fineQ(c)(r)) : s.mergedQ[ki][r];
                 }
 
                 for (uint32_t l = tid; l < lengthCodes; l += kChooseThreads) {

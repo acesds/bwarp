@@ -999,8 +999,10 @@ GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32
     s.uploadSeconds = secondsSince(start);
     start = std::chrono::steady_clock::now();
 
-    gpu::chooseTables<<<coding.segments, gpu::kChooseThreads>>>(deviceBwt.get(), coding.n, coding.logSegment,
-        coding.logSlice, static_cast<uint32_t>(params.contexts), cost.get(), tables.get(), decisions.get());
+    // Up to 2^16 bytes per segment, the counts pack into 16 bits.
+    (coding.logSegment <= 16 ? gpu::chooseTables<true> : gpu::chooseTables<false>)<<<coding.segments,
+        gpu::kChooseThreads>>>(deviceBwt.get(), coding.n, coding.logSegment, coding.logSlice,
+        static_cast<uint32_t>(params.contexts), cost.get(), tables.get(), decisions.get());
 
     uint64_t totalOps = 0;
 

@@ -143,8 +143,8 @@ namespace bwarp {
         return u & 1 ? -static_cast<int32_t>((u + 1) / 2) : static_cast<int32_t>(u / 2);
     }
 
-    // What a table holds: quantized counts, and the ranks derived from them.
-    struct TableData {
+    // What a table holds but its symbol rows, which the GPU encoder keeps as counts while choosing it.
+    struct TableHead {
         uint32_t contexts;
         uint32_t mantissa;
         uint32_t lengthCodes;
@@ -155,8 +155,12 @@ namespace bwarp {
         uint8_t rankOf[256];
         bool symbolUsed[kMaxContexts];
         bool lengthUsed[kMaxLengthContexts];
-        uint16_t symbolQ[kMaxContexts][256];  // by rank
         uint16_t lengthQ[kMaxLengthContexts][kMaxLengthCodes];
+    };
+
+    // What a table holds: quantized counts, and the ranks derived from them.
+    struct TableData : TableHead {
+        uint16_t symbolQ[kMaxContexts][256];  // by rank
     };
 
     // Ranks by quantized token count, descending, ties by byte.
