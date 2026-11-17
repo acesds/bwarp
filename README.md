@@ -9,14 +9,23 @@ How does it work? I took the GPU suffix sorting from my other project, [sadcs](h
 
 Then the BWT gets entropy coded, still on the GPU. Decompression runs it all backwards: it decodes the streams, then undoes the BWT along many independent chains, starting from rows the compressor wrote down.
 
-So how fast is it? enwik9 (1 GB) compresses in 1.6 s (1.63 ns/byte) to 181,939,260 bytes and decompresses in 0.9 s (0.91 ns/byte), with `--segment 16 --slice 16`. That's the wall clock for the whole process, CUDA start-up included. I've only measured it on my own machine, an RTX 5070 Ti with a Ryzen 7 5800X and an NVMe SSD under Windows 11, so your times will differ ([docs/ltcb.md](docs/ltcb.md) has more).
+So how fast is it? Here are enwik8 (100 MB) and enwik9 (1 GB), compressed with `--segment 16 --slice 16`:
+
+| | enwik8 | enwik9 |
+|---|---|---|
+| Compressed | 23,511,124 bytes | 181,939,260 bytes |
+| Ratio | 4.25:1 (1.88 bits/byte) | 5.50:1 (1.46 bits/byte) |
+| Compress | 0.26 s (2.57 ns/byte) | 1.63 s (1.63 ns/byte) |
+| Decompress | 0.22 s (2.20 ns/byte) | 0.91 s (0.91 ns/byte) |
+
+That's the wall clock for the whole process, CUDA start-up included. CUDA start-up and teardown take a bigger share of a smaller file, which is why enwik8 is slower per byte. I've only measured it on my own machine, an RTX 5070 Ti with a Ryzen 7 5800X and an NVMe SSD under Windows 11, so your times will differ ([docs/ltcb.md](docs/ltcb.md) has more).
 
 This is about speed only, so the model is simple on purpose. If ratio is what you're after, context mixing is usually the better fit. Here's all the modeling bwarp does:
 - The BWT is cut into slices (32 KiB by default), and each slice into 32 lanes, one per thread of a warp.
 - The runs in each lane become (symbol, length) tokens.
 - A symbol is coded as its rank in the segment's alphabet, most frequent first, with the previous symbol in the lane as context (up to 16 contexts).
 - A length of 1 to 8 gets its own code. Longer ones get a power-of-two bucket plus extra bits, with the run's symbol as context (up to 4 contexts).
-- Each segment (32 KiB by default) has its own static frequency tables, stored as quantized counts at the front of the block.
+- Each segment (32 KiB by default) gets a semi-static model: its token counts, quantized and stored at the front of the block, and fixed while coding.
 - Interleaved rANS codes the tokens, one state per lane, so a warp decodes a whole slice in lockstep.
 
 The [docs/format.md](docs/format.md) has all the details.
