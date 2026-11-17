@@ -30,6 +30,16 @@ This is about speed only, so the model is simple on purpose. If ratio is what yo
 
 The [docs/format.md](docs/format.md) has all the details.
 
+## Complexity
+
+For a block of n bytes:
+
+- **Building the BWT** takes O(n log ℓ) work, where ℓ is the length of the longest repeated substring, so O(n log n) at worst (think of a file of one repeated byte). Only the prefix doubling depends on ℓ. Radix sorts handle the first 36 characters. After that, each doubling round doubles the compared length, starting at 32, and keeps only the suffixes still tied. The class sorts and the merge are O(n): a comparison in the merge looks at no more than 32 characters and one rank. On enwik9 the doubling rounds take about 4% of the build.
+- **Entropy coding** is O(n) both ways.
+- **The inverse BWT** is O(n): one counting pass for the LF mapping, then n steps spread over many independent chains.
+- **GPU memory** peaks at about 10n bytes to compress. Decompressing takes about 6.3n plus the compressed block, or 10.3n when a block has at most 2,048 chains, because those also walk forward. The CUDA runtime adds its own ~1.4 GiB on top.
+- **Host memory** is about a block's input plus its output, twice over when a file has more than one block, so the next block can be read meanwhile.
+
 ## Command line
 
 ```
