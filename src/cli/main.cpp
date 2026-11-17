@@ -937,6 +937,7 @@ namespace {
         int64_t size = 0;
         int64_t n = 0;  // its text's size
         int index = 0;  // in its file
+        int64_t deviceBytes = 0;  // decompressing: what gpuDecompress() needs
         bool last = false;
     };
 
@@ -1095,6 +1096,7 @@ namespace {
 
                 block.size = static_cast<int64_t>(size);
                 block.n = parsed.layout.n;
+                block.deviceBytes = gpuDecompressRequiredBytes(header, static_cast<size_t>(size));
                 block.last = parsed.last;
                 job.text += block.n;
                 blocks.push_back(block);
@@ -1135,19 +1137,41 @@ namespace {
      public:
         BlockWriter(std::vector<FileJob>& jobs, CodingTotals& totals) : m_jobs(jobs), m_totals(totals) {}
 
-        // False if the block before failed.
-        bool write(const Block& block, const uint8_t* data, size_t size) {
+        // False if the block before failed. With expected, also checks the data's CRC-32C against it meanwhile,
+        // reporting a mismatch as the block called name: the block fails, after it was written.
+        bool write(const Block& block, const uint8_t* data, size_t size, const uint32_t* expected = nullptr,
+            const std::string& name = "") {
             if (!wait()) {
                 return false;
             }
 
             FileJob& job = m_jobs[block.job];
+            const bool check = expected != nullptr;
+            const uint32_t checksum = check ? *expected : 0;
 
             job.started = true;
             job.outBytes += static_cast<int64_t>(size);
             m_job = block.job;
-            m_pending = std::async(std::launch::async,
-                [&job, first = block.index == 0, data, size] { return writeBlock(job, first, data, size); });
+            m_pending = std::async(std::launch::async, [&job, first = block.index == 0, data, size, check, checksum,
+                                                           name] {
+                std::future<uint32_t> computing;
+
+                if (check) {
+                    computing = std::async(std::launch::async, [data, size] { return crc32c(data, size); });
+                }
+
+                bool ok = writeBlock(job, first, data, size);
+
+                if (check) {
+                    if (const uint32_t computed = computing.get(); computed != checksum) {
+                        printf("bwarp: %s: corrupt data: the text's CRC-32C is %08x, the block says %08x\n",
+                            name.c_str(), computed, checksum);
+                        ok = false;
+                    }
+                }
+
+                return ok;
+            });
 
             return true;
         }
@@ -1397,11 +1421,12 @@ namespace {
             return kExitError;
         }
 
-        int64_t largestIn = 1, largestText = 1;
+        int64_t largestIn = 1, largestText = 1, deviceBytes = 0;
 
         for (const Block& block : blocks) {
             largestIn = std::max(largestIn, block.size);
             largestText = std::max(largestText, block.n);
+            deviceBytes = std::max(deviceBytes, block.deviceBytes);
         }
 
         // Two of each: block i is read while i - 1 is decompressed, which is written while i is decompressed. The
@@ -1426,6 +1451,16 @@ namespace {
             }
         }
 
+        // Device memory for the largest block, reused by all.
+        GpuDecompressContext* created = nullptr;
+
+        if (!reportGpu(gpuCreateDecompressContext(deviceBytes, created))) {
+            return kExitError;
+        }
+
+        const std::unique_ptr<GpuDecompressContext, void (*)(GpuDecompressContext*)> context(
+            created, gpuDestroyDecompressContext);
+
         const double setup = secondsSince(start);
 
         if (!options.quiet) {
@@ -1446,8 +1481,9 @@ namespace {
             size_t n = 0;
             GpuDecodeStats stats;
             const auto phase = std::chrono::steady_clock::now();
-            const GpuStatus status = gpuDecompress(buffers[i % 2].data(), static_cast<size_t>(block.size), text.data(),
-                text.capacity(), n, &stats);
+            uint32_t checksum = 0;
+            const GpuStatus status = gpuDecompress(context.get(), buffers[i % 2].data(),
+                static_cast<size_t>(block.size), text.data(), text.capacity(), n, &stats, &checksum);
             const double seconds = secondsSince(phase);
 
             if (status != GpuStatus::Ok) {
@@ -1457,7 +1493,7 @@ namespace {
             totals.gpu += seconds;
             job.seconds += seconds;
 
-            if (!writer.write(block, text.data(), n)) {
+            if (!writer.write(block, text.data(), n, &checksum, blockName(job, block))) {
                 return false;
             }
 
@@ -1466,12 +1502,11 @@ namespace {
 
             if (options.verbose) {
                 printf("  %ssetup %.2f ms, upload %.2f ms, tables %.2f ms, streams %.2f ms, inverse BWT %.2f ms, "
-                       "download %.2f ms, checksum %.2f ms\n",
+                       "download %.2f ms\n",
                     block.index > 0 || !block.last ? ("block " + std::to_string(block.index) + ": ").c_str() : "",
                     1e3 * stats.setupSeconds, 1e3 * stats.uploadSeconds,
                     1e3 * (stats.tableSeconds + stats.finishSeconds), 1e3 * stats.streamSeconds,
-                    1e3 * (stats.rankSeconds + stats.chainSeconds), 1e3 * stats.downloadSeconds,
-                    1e3 * stats.checkSeconds);
+                    1e3 * (stats.rankSeconds + stats.chainSeconds), 1e3 * stats.downloadSeconds);
             }
 
             if (block.last && !options.quiet) {

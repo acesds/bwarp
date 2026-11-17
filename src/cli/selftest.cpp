@@ -531,6 +531,9 @@ namespace {
 
     // ---- GPU -----------------------------------------------------------------------------------
 
+    // Shared by the GPU cases, created with no reserve so that its pool grows and is reused across them.
+    GpuDecompressContext* decompressContext = nullptr;
+
     // The construction, checked, then compressed and decompressed on the GPU.
     void testGpu(Suite& suite, const std::string& name, const std::vector<uint8_t>& input, GpuBwtContext* context = nullptr) {
         const int32_t n = static_cast<int32_t>(input.size());
@@ -630,6 +633,23 @@ namespace {
                 suite.reportFailure(name + " GPU round trip", "decompressing into a buffer", -1);
                 return;
             }
+
+            // With the shared context: the check left to the caller, then made, also of the wrong checksum.
+            uint32_t stored = 0;
+
+            buffer.assign(buffer.size(), 0);
+            suite.cases++;
+
+            if (gpuDecompress(decompressContext, encoded.data(), encoded.size(), buffer.data(), buffer.size(), size,
+                    nullptr, &stored) != GpuStatus::Ok ||
+                size != input.size() || buffer != input || stored != checksum ||
+                gpuDecompress(decompressContext, encoded.data(), encoded.size(), buffer.data(), buffer.size(),
+                    size) != GpuStatus::Ok ||
+                gpuDecompress(decompressContext, wrong.data(), wrong.size(), buffer.data(), buffer.size(), size) !=
+                    GpuStatus::ChecksumMismatch) {
+                suite.reportFailure(name + " GPU round trip", "decompressing with a context", -1);
+                return;
+            }
         }
 
         if (suite.verbose) {
@@ -688,6 +708,13 @@ namespace {
             device.computeMinor, static_cast<long long>(device.freeBytes >> 20));
         Rng rng{3};
 
+        suite.cases++;
+
+        if (gpuCreateDecompressContext(0, decompressContext) != GpuStatus::Ok) {
+            suite.reportFailure("GPU decompression context", gpuLastError(), -1);
+            return;
+        }
+
         testGpu(suite, "\"\"", {});
         testGpu(suite, "\"a\"", textOf("a"));
         testGpu(suite, "\"banana\"", textOf("banana"));
@@ -722,6 +749,8 @@ namespace {
         testGpu(suite, "large random sigma=256", randomText(rng, kLargeTextSize, 256));
 
         runGpuContextCases(suite, rng);
+        gpuDestroyDecompressContext(decompressContext);
+        decompressContext = nullptr;
     }
 }
 

@@ -114,6 +114,24 @@ GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& 
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, uint8_t* text, size_t capacity, size_t& n,
     GpuDecodeStats* stats = nullptr);
 
+// Device memory for gpuDecompress(), a pool reserved up front and reused across calls: without one, each call
+// allocates its own, about 60 ms for a block of 1 GiB.
+struct GpuDecompressContext;
+
+// The device memory to decompress a block of size bytes whose header, kHeaderBytes, is given; -1 if the header
+// is invalid. A context reserving the largest of a file's blocks allocates nothing more for them.
+int64_t gpuDecompressRequiredBytes(const uint8_t* header, size_t size);
+
+// NotEnoughMemory if reserve + kGpuMemoryReserve exceeds the free memory.
+GpuStatus gpuCreateDecompressContext(int64_t reserve, GpuDecompressContext*& context);
+
+void gpuDestroyDecompressContext(GpuDecompressContext* context);
+
+// The buffer overload with a context (or none). With storedChecksum, the block's stored CRC-32C goes there and
+// the check is left to the caller, which may run it alongside writing the text.
+GpuStatus gpuDecompress(GpuDecompressContext* context, const uint8_t* data, size_t size, uint8_t* text,
+    size_t capacity, size_t& n, GpuDecodeStats* stats = nullptr, uint32_t* storedChecksum = nullptr);
+
 // ---- Encoding ----------------------------------------------------------------------------------
 
 struct GpuEncodeStats {

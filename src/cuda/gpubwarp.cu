@@ -717,8 +717,9 @@ namespace {
         DeviceArray<uint32_t> error;
     };
 
-    // Leaves the BWT in d.bwt.
-    GpuStatus decodeOnDevice(const uint8_t* data, size_t size, DeviceDecode& d, GpuDecodeStats& s) {
+    // Leaves the BWT in d.bwt. With a pool, the device memory comes from it.
+    GpuStatus decodeOnDevice(const uint8_t* data, size_t size, DeviceDecode& d, GpuDecodeStats& s,
+        cudaMemPool_t pool = nullptr) {
         using namespace bwarp;
 
         if (!readContainer(data, size, d.container)) {
@@ -734,13 +735,13 @@ namespace {
         cudaError_t error;
         auto start = std::chrono::steady_clock::now();
 
-        if ((error = d.data.allocate(size, s.deviceBytes)) != cudaSuccess ||
-            (error = d.bwt.allocate((size_t(layout.n) + 15) & ~size_t(15), s.deviceBytes)) != cudaSuccess ||
-            (error = d.segmentOffsets.allocate(layout.segments + 1, s.deviceBytes)) != cudaSuccess ||
-            (error = d.sliceOffsets.allocate(layout.slices + 1, s.deviceBytes)) != cudaSuccess ||
-            (error = d.tables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
-            (error = d.deviceTables.allocate(layout.segments, s.deviceBytes)) != cudaSuccess ||
-            (error = d.error.allocate(1, s.deviceBytes)) != cudaSuccess) {
+        if ((error = d.data.allocate(size, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.bwt.allocate((size_t(layout.n) + 15) & ~size_t(15), s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.segmentOffsets.allocate(layout.segments + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.sliceOffsets.allocate(layout.slices + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.tables.allocate(layout.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.deviceTables.allocate(layout.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = d.error.allocate(1, s.deviceBytes, pool)) != cudaSuccess) {
             return failed("cudaMalloc", error);
         }
 
@@ -808,7 +809,7 @@ namespace {
     }
 
     // The text of d.bwt into text (at least 16 bytes, for its 16-byte stores). n > 0.
-    GpuStatus invertOnDevice(DeviceDecode& d, DeviceArray<uint32_t>& text, GpuDecodeStats& s) {
+    GpuStatus invertOnDevice(DeviceDecode& d, DeviceArray<uint32_t>& text, GpuDecodeStats& s, cudaMemPool_t pool) {
         using namespace bwarp;
 
         const Layout& layout = d.container.layout;
@@ -825,12 +826,12 @@ namespace {
 
         if ((error = cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, offsets.get(), offsets.get(),
                  256 * tiles)) != cudaSuccess ||
-            (error = lf.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess ||
-            (both && (error = psi.allocate(size_t(n) + 1, s.deviceBytes)) != cudaSuccess) ||
-            (error = offsets.allocate(size_t(256) * tiles, s.deviceBytes)) != cudaSuccess ||
-            (error = samples.allocate(layout.samples, s.deviceBytes)) != cudaSuccess ||
-            (error = temp.allocate(scanBytes, s.deviceBytes)) != cudaSuccess ||
-            (error = text.allocate((size_t(n) + 15) / 4 & ~size_t(3), s.deviceBytes)) != cudaSuccess ||
+            (error = lf.allocate(size_t(n) + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (both && (error = psi.allocate(size_t(n) + 1, s.deviceBytes, pool)) != cudaSuccess) ||
+            (error = offsets.allocate(size_t(256) * tiles, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = samples.allocate(layout.samples, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = temp.allocate(scanBytes, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = text.allocate((size_t(n) + 15) / 4 & ~size_t(3), s.deviceBytes, pool)) != cudaSuccess ||
             (layout.samples > 0 &&
                 (error = cudaMemcpy(samples.get(), d.container.samples.data(), size_t(layout.samples) * 4,
                      cudaMemcpyHostToDevice)) != cudaSuccess) ||
@@ -907,9 +908,11 @@ GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt,
 }
 
 namespace {
-    // gpuDecompress(), downloading to room(n): where the n bytes of text go, or null if they don't fit.
+    // gpuDecompress(), downloading to room(n): where the n bytes of text go, or null if they don't fit. With a
+    // pool, the device memory comes from it; with storedChecksum, the check is left to the caller.
     template <class Room>
-    GpuStatus decompress(const uint8_t* data, size_t size, GpuDecodeStats* stats, Room room) {
+    GpuStatus decompress(const uint8_t* data, size_t size, GpuDecodeStats* stats, Room room, cudaMemPool_t pool,
+        uint32_t* storedChecksum) {
         lastError[0] = '\0';
 
         GpuDecodeStats local;
@@ -919,14 +922,14 @@ namespace {
 
         s = GpuDecodeStats{};
 
-        if (const GpuStatus status = decodeOnDevice(data, size, d, s); status != GpuStatus::Ok) {
+        if (const GpuStatus status = decodeOnDevice(data, size, d, s, pool); status != GpuStatus::Ok) {
             return status;
         }
 
         const uint32_t n = d.container.layout.n;
 
         if (n > 0) {
-            if (const GpuStatus status = invertOnDevice(d, deviceText, s); status != GpuStatus::Ok) {
+            if (const GpuStatus status = invertOnDevice(d, deviceText, s, pool); status != GpuStatus::Ok) {
                 return status;
             }
         }
@@ -946,6 +949,11 @@ namespace {
 
         s.downloadSeconds = secondsSince(start);
 
+        if (storedChecksum) {
+            *storedChecksum = d.container.checksum;
+            return GpuStatus::Ok;
+        }
+
         const auto checking = std::chrono::steady_clock::now();
         const uint32_t checksum = crc32c(text, n);
 
@@ -962,20 +970,107 @@ namespace {
 }
 
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats) {
-    return decompress(data, size, stats, [&](uint32_t n) {
-        text.resize(n);
-        return text.data();
-    });
+    return decompress(
+        data, size, stats,
+        [&](uint32_t n) {
+            text.resize(n);
+            return text.data();
+        },
+        nullptr, nullptr);
 }
 
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, uint8_t* text, size_t capacity, size_t& n,
     GpuDecodeStats* stats) {
+    return gpuDecompress(nullptr, data, size, text, capacity, n, stats);
+}
+
+struct GpuDecompressContext {
+    cudaMemPool_t pool = nullptr;
+
+    GpuDecompressContext() = default;
+    GpuDecompressContext(const GpuDecompressContext&) = delete;
+    GpuDecompressContext& operator=(const GpuDecompressContext&) = delete;
+
+    ~GpuDecompressContext() {
+        cudaStreamSynchronize(0);  // the frees of the last call
+
+        if (pool) {
+            cudaMemPoolDestroy(pool);
+        }
+    }
+};
+
+int64_t gpuDecompressRequiredBytes(const uint8_t* header, size_t size) {
+    using namespace bwarp;
+
+    BlockHeader parsed;
+
+    if (!readBlockHeader(header, parsed)) {
+        return -1;
+    }
+
+    // As decodeOnDevice() and invertOnDevice() allocate, each rounded up for the pool's granularity.
+    const Layout& layout = parsed.layout;
+    const uint64_t n = layout.n;
+    const uint64_t tiles = (n + gpu::kRankTile - 1) / gpu::kRankTile;
+    const bool both = layout.samples + 1 <= gpu::kMaxBidirectionalChains;
+    const uint64_t arrays[] = {size, n + 16, 8 * (uint64_t(layout.segments) + 1), 8 * (uint64_t(layout.slices) + 1),
+        sizeof(TableData) * layout.segments, sizeof(gpu::DeviceTable) * layout.segments, 4, 4 * (n + 1),
+        both ? 4 * (n + 1) : 0, 1024 * tiles, 4 * uint64_t(layout.samples), (n + 16) & ~uint64_t(15)};
+    uint64_t total = uint64_t(1) << 20;  // the scan's temporary storage, with room to spare
+
+    for (const uint64_t bytes : arrays) {
+        total += (bytes + 4095) & ~uint64_t(4095);
+    }
+
+    return static_cast<int64_t>(total);
+}
+
+GpuStatus gpuCreateDecompressContext(int64_t reserve, GpuDecompressContext*& context) {
+    lastError[0] = '\0';
+    context = nullptr;
+    GpuDevice device;
+
+    if (const GpuStatus status = gpuQueryDevice(device); status != GpuStatus::Ok) {
+        return status;
+    }
+
+    if (const GpuStatus status = checkMemory(std::max<int64_t>(reserve, 0)); status != GpuStatus::Ok) {
+        return status;
+    }
+
+    std::unique_ptr<GpuDecompressContext> created(new (std::nothrow) GpuDecompressContext);
+
+    if (!created) {
+        snprintf(lastError, sizeof lastError, "out of host memory");
+        return GpuStatus::Failed;
+    }
+
+    if (const cudaError_t error = createPool(created->pool, static_cast<size_t>(std::max<int64_t>(reserve, 0)));
+        error != cudaSuccess) {
+        return failed("memory pool", error);
+    }
+
+    context = created.release();
+
+    return GpuStatus::Ok;
+}
+
+void gpuDestroyDecompressContext(GpuDecompressContext* context) {
+    delete context;
+}
+
+GpuStatus gpuDecompress(GpuDecompressContext* context, const uint8_t* data, size_t size, uint8_t* text,
+    size_t capacity, size_t& n, GpuDecodeStats* stats, uint32_t* storedChecksum) {
     n = 0;
 
-    return decompress(data, size, stats, [&](uint32_t bytes) {
-        n = bytes;
-        return bytes <= capacity ? text : nullptr;
-    });
+    return decompress(
+        data, size, stats,
+        [&](uint32_t bytes) {
+            n = bytes;
+            return bytes <= capacity ? text : nullptr;
+        },
+        context ? context->pool : nullptr, storedChecksum);
 }
 
 // ---- Encoding ----------------------------------------------------------------------------------
