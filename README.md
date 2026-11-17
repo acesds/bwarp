@@ -25,6 +25,8 @@ bwarp bwt <in> <out.bwt>
 bwarp check <in> <in.bwt>
 bwarp test <in|dir> [--recursive]
 bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]
+bwarp compress <in> [<out>] | <dir> <outdir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--recursive] [--force] [--verbose]
+bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force] [--verbose]
 bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--gpu [--verbose]] [--recursive]
 bwarp selftest [--verbose]
 ```
@@ -36,6 +38,7 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block, the same as `
 - `check`: verify a BWT file against its text by inverting it on the CPU (sequential, about 12 MB/s on enwik8).
 - `test`: build and check in memory, with the GPU's phases and memory. On a directory it runs every file in it (`--recursive` to include subdirectories), one row per file plus a total.
 - `bench`: time the GPU build, the best of `--runs` (default 5) after a warmup, with each phase. `--context` reuses one GPU context per file, `--pinned` uses page-locked host buffers. `--context --pinned` measures the way libcubwt's benchmark does.
+- `compress`: compress on the GPU, BWT and encoder without a round trip through the host, into `<in>.bwarp` unless `<out>` is given; a directory's files go to the same names plus `.bwarp` under `<outdir>`. The encoding options are those of `ratio`. `decompress` does the reverse, of a directory's `.bwarp` files. Both read the next file while the GPU works on the current one, into page-locked buffers, refuse to overwrite files without `--force`, and print each file's speed and the totals with reading and writing; `--verbose` adds the phases.
 - `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use, `--sample` (default automatic, 10 to 31) an inverse BWT chain per 2^LOG2 bytes. `--gpu` also encodes and decompresses on the GPU, checks both, and prints their speeds without transfers (the faster of two runs), that of the stream kernel and that of the inverse BWT. It also runs the whole compression on the GPU, BWT and encoder without a round trip through the host, checks it against the CPU encoder and prints its speed host to host (`gcmp`); `--verbose` adds each phase, and the time of building the BWT and encoding it as two calls.
 - `selftest`: the checker on known BWTs and planted errors, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder and decompressor must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker and then compressed and decompressed on the GPU (GPU cases skipped without a device).
 

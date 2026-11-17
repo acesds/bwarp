@@ -8,6 +8,7 @@
  */
 
 #include "fileio.h"
+#include <algorithm>
 #include <cstdio>
 
 namespace {
@@ -52,6 +53,32 @@ bool writeWholeFile(const char* path, const void* data, size_t size) {
     const bool closed = fclose(fp) == 0;
 
     return bytesWritten == size && closed;
+}
+
+bool readFileInto(const char* path, void* buffer, size_t size) {
+    FILE* fp = fopen(path, "rb");
+
+    if (!fp) {
+        return false;
+    }
+
+    // In pieces of at most 1 GiB, each one call underneath.
+    constexpr size_t kPiece = size_t(1) << 30;
+    size_t done = 0;
+
+    while (done < size) {
+        const size_t got = fread(static_cast<uint8_t*>(buffer) + done, 1, std::min(kPiece, size - done), fp);
+
+        if (got == 0) {
+            break;
+        }
+
+        done += got;
+    }
+
+    fclose(fp);
+
+    return done == size;
 }
 
 bool readBwtFile(const char* path, std::vector<uint8_t>& out, int32_t& primary) {

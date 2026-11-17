@@ -106,6 +106,11 @@ GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt,
 // Decodes bwarp data and inverts the BWT on the device: the original text.
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats = nullptr);
 
+// The same into text, of capacity bytes: NotEnoughMemory if the text, n bytes (the header's), doesn't fit.
+// Page-locked, text takes the download at full speed.
+GpuStatus gpuDecompress(const uint8_t* data, size_t size, uint8_t* text, size_t capacity, size_t& n,
+    GpuDecodeStats* stats = nullptr);
+
 // ---- Encoding ----------------------------------------------------------------------------------
 
 struct GpuEncodeStats {

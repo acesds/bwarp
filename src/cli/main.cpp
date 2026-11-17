@@ -14,11 +14,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include <system_error>
 #include <vector>
 #include "checker.h"
+#include "container.h"
 #include "cpucodec.h"
 #include "format.h"
 #include "fileio.h"
@@ -40,6 +42,7 @@ namespace {
         bool context = false;
         bool pinned = false;
         bool gpu = false;
+        bool force = false;
         EncodeParams encode;
     };
 
@@ -69,6 +72,9 @@ namespace {
             "bwarp - a GPU-based BWT file compressor\n"
             "\n"
             "usage:\n"
+            "  bwarp compress <in> [<out>] | <dir> <outdir> [--segment LOG2] [--slice LOG2] [--contexts K]\n"
+            "              [--sample LOG2] [--recursive] [--force] [--verbose]\n"
+            "  bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force] [--verbose]\n"
             "  bwarp info\n"
             "  bwarp bwt <in> <out.bwt>\n"
             "  bwarp check <in> <in.bwt>\n"
@@ -78,6 +84,10 @@ namespace {
             "              [--gpu [--verbose]] [--recursive]\n"
             "  bwarp selftest [--verbose]\n"
             "\n"
+            "compress compresses on the GPU, BWT and encoder, into <in>.bwarp unless <out> is given; a\n"
+            "directory's files go to the same names plus .bwarp under <outdir>. decompress does the\n"
+            "reverse, of a directory's .bwarp files. Both read the next file while the GPU works on\n"
+            "the current one and refuse to overwrite files without --force; --verbose adds the phases.\n"
             "The .bwt file is divsufsort's bwt format as one block: n, the primary index, the n bytes\n"
             "(the same as sadcs build --bwt).\n"
             "info prints the GPU, or that bwarp was built without CUDA.\n"
@@ -124,6 +134,8 @@ namespace {
                 options.context = true;
             } else if (strcmp(arg, "--gpu") == 0) {
                 options.gpu = true;
+            } else if (strcmp(arg, "--force") == 0) {
+                options.force = true;
             } else if (strcmp(arg, "--pinned") == 0) {
                 options.pinned = true;
             } else if (strcmp(arg, "--recursive") == 0) {
@@ -842,6 +854,412 @@ namespace {
 
         return passed == files.size() ? kExitOk : kExitError;
     }
+
+    // ---- compress and decompress ---------------------------------------------------------------
+
+    // Page-locked host memory: transfers from and to it skip the staging copies.
+    class PinnedBuffer {
+     public:
+        PinnedBuffer() = default;
+        PinnedBuffer(const PinnedBuffer&) = delete;
+        PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+
+        ~PinnedBuffer() {
+            gpuFreePinned(m_data);
+        }
+
+        bool allocate(size_t bytes) {
+            gpuFreePinned(m_data);
+            m_data = static_cast<uint8_t*>(gpuAllocatePinned(bytes));
+            m_capacity = m_data ? bytes : 0;
+            return m_data != nullptr;
+        }
+
+        uint8_t* data() const {
+            return m_data;
+        }
+
+        size_t capacity() const {
+            return m_capacity;
+        }
+
+     private:
+        uint8_t* m_data = nullptr;
+        size_t m_capacity = 0;
+    };
+
+    constexpr const char* kExtension = ".bwarp";
+
+    struct FileJob {
+        std::filesystem::path in, out;
+        std::string name;
+        int64_t size = 0;  // of the input
+        int64_t n = 0;     // decompressing: the text's, from the header
+    };
+
+    bool hasExtension(const std::filesystem::path& path) {
+        return path.extension() == kExtension;
+    }
+
+    // Pairs each input with its output: a file with paths[1], or with its name plus or minus .bwarp; a directory's
+    // files (compressing all, decompressing those ending in .bwarp) with the same names under paths[1]. Existing
+    // outputs are an error without --force.
+    bool planJobs(const Options& options, bool compressing, std::vector<FileJob>& jobs, int& nameWidth) {
+        if (options.pathCount < 1) {
+            printUsage();
+            return false;
+        }
+
+        const std::filesystem::path in(options.paths[0]);
+        std::error_code error;
+        const bool directory = std::filesystem::is_directory(in, error);
+        std::vector<std::filesystem::path> files;
+
+        if (directory) {
+            if (options.pathCount != 2) {
+                printf("bwarp: a directory needs an output directory\n");
+                return false;
+            }
+
+            if (!listFiles(in, options.recursive, files)) {
+                printf("bwarp: cannot list directory '%s'\n", options.paths[0]);
+                return false;
+            }
+        } else {
+            files.push_back(in);
+        }
+
+        nameWidth = 5;
+
+        for (const auto& file : files) {
+            if (!compressing && directory && !hasExtension(file)) {
+                continue;
+            }
+
+            FileJob job;
+
+            job.in = file;
+            job.name = directory ? file.lexically_relative(in).generic_string() : file.filename().string();
+
+            if (directory) {
+                job.out = std::filesystem::path(options.paths[1]) / file.lexically_relative(in);
+            } else if (options.pathCount == 2) {
+                job.out = options.paths[1];
+            } else if (compressing) {
+                job.out = file;
+            } else if (hasExtension(file)) {
+                job.out = file;
+                job.out.replace_extension();
+            } else {
+                printf("bwarp: '%s' doesn't end in %s; name the output\n", options.paths[0], kExtension);
+                return false;
+            }
+
+            if (directory || options.pathCount != 2) {
+                if (compressing) {
+                    job.out += kExtension;
+                } else if (directory) {
+                    job.out.replace_extension();
+                }
+            }
+
+            job.size = static_cast<int64_t>(std::filesystem::file_size(file, error));
+
+            if (error) {
+                printf("bwarp: cannot read '%s'\n", file.string().c_str());
+                return false;
+            }
+
+            if (compressing && job.size > kMaxTextSize) {
+                printf("bwarp: '%s' is too large (%lld bytes, at most %lld supported)\n", file.string().c_str(),
+                    static_cast<long long>(job.size), static_cast<long long>(kMaxTextSize));
+                return false;
+            }
+
+            if (std::filesystem::equivalent(job.in, job.out, error)) {
+                printf("bwarp: '%s' would overwrite its own input\n", job.out.string().c_str());
+                return false;
+            }
+
+            if (!options.force && std::filesystem::exists(job.out, error)) {
+                printf("bwarp: '%s' exists (--force overwrites it)\n", job.out.string().c_str());
+                return false;
+            }
+
+            nameWidth = std::max(nameWidth, static_cast<int>(job.name.size()));
+            jobs.push_back(std::move(job));
+        }
+
+        if (jobs.empty()) {
+            printf("bwarp: no %sfiles in '%s'\n", compressing ? "" : ".bwarp ", options.paths[0]);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool writeOutput(const FileJob& job, const uint8_t* data, size_t size) {
+        std::error_code error;
+
+        if (job.out.has_parent_path()) {
+            std::filesystem::create_directories(job.out.parent_path(), error);
+        }
+
+        if (!writeWholeFile(job.out.string().c_str(), data, size)) {
+            printf("bwarp: cannot write '%s'\n", job.out.string().c_str());
+            return false;
+        }
+
+        return true;
+    }
+
+    struct CodingTotals {
+        int64_t in = 0;
+        int64_t out = 0;
+        double readWait = 0.0;  // waiting for the reader
+        double gpu = 0.0;       // the (de)compression calls, host to host
+        double write = 0.0;
+    };
+
+    // Reads job i into buffers[i % 2] on another thread while process(i) runs on the one before. process(i) is
+    // only called for jobs read in full; it returns false to stop.
+    template <class Process>
+    bool pipelineJobs(const std::vector<FileJob>& jobs, PinnedBuffer* buffers, CodingTotals& totals, Process process) {
+        const auto read = [&](size_t i) {
+            return readFileInto(jobs[i].in.string().c_str(), buffers[i % 2].data(), static_cast<size_t>(jobs[i].size));
+        };
+        std::future<bool> pending = std::async(std::launch::async, read, size_t(0));
+        bool ok = true;
+
+        for (size_t i = 0; i < jobs.size(); i++) {
+            const auto start = std::chrono::steady_clock::now();
+            const bool readOk = pending.get();
+
+            totals.readWait += secondsSince(start);
+
+            if (i + 1 < jobs.size()) {
+                pending = std::async(std::launch::async, read, i + 1);
+            }
+
+            if (!readOk) {
+                printf("bwarp: cannot read '%s'\n", jobs[i].in.string().c_str());
+                ok = false;
+                continue;
+            }
+
+            if (!process(i)) {
+                return false;  // the pending read finishes in the future's destructor
+            }
+        }
+
+        return ok;
+    }
+
+    // Bits per byte of the text, and its megabytes per second.
+    void printCodingRow(const char* name, int nameWidth, int64_t in, int64_t out, int64_t compressed, int64_t text,
+        double seconds) {
+        printf("%-*s %12lld %12lld %6.3f %8.2f %8.1f\n", nameWidth, name, static_cast<long long>(in),
+            static_cast<long long>(out), text > 0 ? 8.0 * compressed / text : 0.0, 1e3 * seconds,
+            megabytesPerSecond(text, seconds));
+    }
+
+    // Prints the totals and the phases: setup before the first file, then the wall time over all files.
+    void printCodingTotals(const char* verb, int nameWidth, size_t files, const CodingTotals& t, int64_t text,
+        double setup, double wall) {
+        if (files > 1) {
+            printCodingRow("total", nameWidth, t.in, t.out, t.in + t.out - text, text, t.gpu);
+        }
+
+        printf("%s %zu file%s in %.1f ms (%.1f MB/s with reading and writing; setup %.1f ms before): GPU %.1f ms, "
+               "waiting to read %.1f ms, writing %.1f ms\n",
+            verb, files, files == 1 ? "" : "s", 1e3 * wall, megabytesPerSecond(text, wall), 1e3 * setup, 1e3 * t.gpu,
+            1e3 * t.readWait, 1e3 * t.write);
+    }
+
+    int cmdCompress(const Options& options) {
+        std::vector<FileJob> jobs;
+        int nameWidth;
+        const EncodeParams& params = options.encode;
+
+        if (!planJobs(options, true, jobs, nameWidth)) {
+            return kExitError;
+        }
+
+        // One context and two input buffers for the largest file, made before the first is read.
+        auto start = std::chrono::steady_clock::now();
+        int64_t largest = 0;
+
+        for (const FileJob& job : jobs) {
+            largest = std::max(largest, job.size);
+        }
+
+        GpuBwtContext* created = nullptr;
+
+        if (!reportGpu(gpuCreateBwtContext(static_cast<int32_t>(largest), created))) {
+            return kExitError;
+        }
+
+        const std::unique_ptr<GpuBwtContext, void (*)(GpuBwtContext*)> context(created, gpuDestroyBwtContext);
+        PinnedBuffer buffers[2];
+
+        for (size_t b = 0; b < std::min<size_t>(2, jobs.size()); b++) {
+            if (!buffers[b].allocate(static_cast<size_t>(largest))) {
+                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largest));
+                return kExitError;
+            }
+        }
+
+        const double setup = secondsSince(start);
+
+        printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts, samples %s\n", options.paths[0], jobs.size(),
+            jobs.size() == 1 ? "" : "s", params.logSegment, params.logSlice, params.contexts,
+            params.logSample != 0 ? ("2^" + std::to_string(params.logSample)).c_str() : "auto");
+        printf("%-*s %12s %12s %6s %8s %8s\n", nameWidth, "file", "bytes", "compressed", "bpc", "GPU ms", "MB/s");
+
+        CodingTotals totals;
+
+        start = std::chrono::steady_clock::now();
+
+        const bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
+            const FileJob& job = jobs[i];
+            const int32_t n = static_cast<int32_t>(job.size);
+            const uint8_t* compressed = nullptr;
+            size_t size = 0;
+            GpuCompressStats stats;
+            auto phase = std::chrono::steady_clock::now();
+            const GpuStatus status =
+                gpuCompress(context.get(), buffers[i % 2].data(), n, params, compressed, size, nullptr, &stats);
+            const double seconds = secondsSince(phase);
+
+            if (!reportGpu(status)) {
+                return false;
+            }
+
+            totals.gpu += seconds;
+            phase = std::chrono::steady_clock::now();
+
+            if (!writeOutput(job, compressed, size)) {
+                return false;
+            }
+
+            totals.write += secondsSince(phase);
+            totals.in += job.size;
+            totals.out += static_cast<int64_t>(size);
+            printCodingRow(job.name.c_str(), nameWidth, job.size, static_cast<int64_t>(size), static_cast<int64_t>(size),
+                job.size, seconds);
+
+            if (options.verbose) {
+                const GpuBwtStats& b = stats.bwt;
+                const GpuEncodeStats& g = stats.encode;
+
+                printf("  upload %.2f ms, BWT %.2f ms, handover %.2f ms, encoding %.2f ms, download %.2f ms\n",
+                    1e3 * b.uploadSeconds, 1e3 * b.deviceSeconds, 1e3 * g.uploadSeconds,
+                    1e3 * (g.setupSeconds + g.chooseSeconds + g.tableSeconds + g.streamSeconds + g.placeSeconds),
+                    1e3 * g.downloadSeconds);
+            }
+
+            return true;
+        });
+
+        printCodingTotals("compressed", nameWidth, jobs.size(), totals, totals.in, setup, secondsSince(start));
+
+        return ok ? kExitOk : kExitError;
+    }
+
+    int cmdDecompress(const Options& options) {
+        std::vector<FileJob> jobs;
+        int nameWidth;
+
+        if (!planJobs(options, false, jobs, nameWidth)) {
+            return kExitError;
+        }
+
+        // Each header gives its text's size, so that the buffers are made before the first file is read.
+        auto start = std::chrono::steady_clock::now();
+        int64_t largestIn = 0, largestText = 0;
+
+        for (FileJob& job : jobs) {
+            uint8_t header[bwarp::kHeaderBytes];
+
+            if (job.size < bwarp::kHeaderBytes || !readFileInto(job.in.string().c_str(), header, sizeof header) ||
+                bwarp::get32(header) != bwarp::kMagic) {
+                printf("bwarp: '%s' is not a bwarp file\n", job.in.string().c_str());
+                return kExitError;
+            }
+
+            job.n = bwarp::get32(header + 12);
+            largestIn = std::max(largestIn, job.size);
+            largestText = std::max(largestText, job.n);
+        }
+
+        PinnedBuffer buffers[2], text;
+
+        for (size_t b = 0; b < std::min<size_t>(2, jobs.size()); b++) {
+            if (!buffers[b].allocate(static_cast<size_t>(largestIn))) {
+                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largestIn));
+                return kExitError;
+            }
+        }
+
+        if (!text.allocate(static_cast<size_t>(largestText))) {
+            printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largestText));
+            return kExitError;
+        }
+
+        const double setup = secondsSince(start);
+
+        printf("%s: %zu file%s\n", options.paths[0], jobs.size(), jobs.size() == 1 ? "" : "s");
+        printf("%-*s %12s %12s %6s %8s %8s\n", nameWidth, "file", "bytes", "text", "bpc", "GPU ms", "MB/s");
+
+        CodingTotals totals;
+        int64_t textBytes = 0;
+
+        start = std::chrono::steady_clock::now();
+
+        const bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
+            const FileJob& job = jobs[i];
+            size_t n = 0;
+            GpuDecodeStats stats;
+            auto phase = std::chrono::steady_clock::now();
+            const GpuStatus status = gpuDecompress(buffers[i % 2].data(), static_cast<size_t>(job.size), text.data(),
+                text.capacity(), n, &stats);
+            const double seconds = secondsSince(phase);
+
+            if (status != GpuStatus::Ok) {
+                printf("bwarp: '%s': ", job.in.string().c_str());
+                reportGpu(status);
+                return false;
+            }
+
+            totals.gpu += seconds;
+            phase = std::chrono::steady_clock::now();
+
+            if (!writeOutput(job, text.data(), n)) {
+                return false;
+            }
+
+            totals.write += secondsSince(phase);
+            totals.in += job.size;
+            totals.out += static_cast<int64_t>(n);
+            textBytes += static_cast<int64_t>(n);
+            printCodingRow(job.name.c_str(), nameWidth, job.size, static_cast<int64_t>(n), job.size,
+                static_cast<int64_t>(n), seconds);
+
+            if (options.verbose) {
+                printf("  setup %.2f ms, upload %.2f ms, tables %.2f ms, streams %.2f ms, inverse BWT %.2f ms, "
+                       "download %.2f ms\n",
+                    1e3 * stats.setupSeconds, 1e3 * stats.uploadSeconds,
+                    1e3 * (stats.tableSeconds + stats.finishSeconds), 1e3 * stats.streamSeconds,
+                    1e3 * (stats.rankSeconds + stats.chainSeconds), 1e3 * stats.downloadSeconds);
+            }
+
+            return true;
+        });
+
+        printCodingTotals("decompressed", nameWidth, jobs.size(), totals, textBytes, setup, secondsSince(start));
+
+        return ok ? kExitOk : kExitError;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -855,6 +1273,14 @@ int main(int argc, char** argv) {
 
     if (!parseOptions(argc, argv, options)) {
         return kExitError;
+    }
+
+    if (strcmp(command, "compress") == 0) {
+        return cmdCompress(options);
+    }
+
+    if (strcmp(command, "decompress") == 0) {
+        return cmdDecompress(options);
     }
 
     if (strcmp(command, "info") == 0) {

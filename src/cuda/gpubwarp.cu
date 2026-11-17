@@ -892,40 +892,65 @@ GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt,
     return GpuStatus::Ok;
 }
 
-GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats) {
-    lastError[0] = '\0';
+namespace {
+    // gpuDecompress(), downloading to room(n): where the n bytes of text go, or null if they don't fit.
+    template <class Room>
+    GpuStatus decompress(const uint8_t* data, size_t size, GpuDecodeStats* stats, Room room) {
+        lastError[0] = '\0';
 
-    GpuDecodeStats local;
-    GpuDecodeStats& s = stats ? *stats : local;
-    DeviceDecode d;
-    DeviceArray<uint32_t> deviceText;
+        GpuDecodeStats local;
+        GpuDecodeStats& s = stats ? *stats : local;
+        DeviceDecode d;
+        DeviceArray<uint32_t> deviceText;
 
-    s = GpuDecodeStats{};
+        s = GpuDecodeStats{};
 
-    if (const GpuStatus status = decodeOnDevice(data, size, d, s); status != GpuStatus::Ok) {
-        return status;
-    }
-
-    const uint32_t n = d.container.layout.n;
-
-    if (n > 0) {
-        if (const GpuStatus status = invertOnDevice(d, deviceText, s); status != GpuStatus::Ok) {
+        if (const GpuStatus status = decodeOnDevice(data, size, d, s); status != GpuStatus::Ok) {
             return status;
         }
+
+        const uint32_t n = d.container.layout.n;
+
+        if (n > 0) {
+            if (const GpuStatus status = invertOnDevice(d, deviceText, s); status != GpuStatus::Ok) {
+                return status;
+            }
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        uint8_t* const text = room(n);
+        cudaError_t error;
+
+        if (n > 0 && !text) {
+            snprintf(lastError, sizeof lastError, "the text of %u bytes does not fit the buffer", n);
+            return GpuStatus::NotEnoughMemory;
+        }
+
+        if (n > 0 && (error = cudaMemcpy(text, deviceText.get(), n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+            return failed("download", error);
+        }
+
+        s.downloadSeconds = secondsSince(start);
+
+        return GpuStatus::Ok;
     }
+}
 
-    const auto start = std::chrono::steady_clock::now();
-    cudaError_t error;
+GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats) {
+    return decompress(data, size, stats, [&](uint32_t n) {
+        text.resize(n);
+        return text.data();
+    });
+}
 
-    text.resize(n);
+GpuStatus gpuDecompress(const uint8_t* data, size_t size, uint8_t* text, size_t capacity, size_t& n,
+    GpuDecodeStats* stats) {
+    n = 0;
 
-    if (n > 0 && (error = cudaMemcpy(text.data(), deviceText.get(), n, cudaMemcpyDeviceToHost)) != cudaSuccess) {
-        return failed("download", error);
-    }
-
-    s.downloadSeconds = secondsSince(start);
-
-    return GpuStatus::Ok;
+    return decompress(data, size, stats, [&](uint32_t bytes) {
+        n = bytes;
+        return bytes <= capacity ? text : nullptr;
+    });
 }
 
 // ---- Encoding ----------------------------------------------------------------------------------

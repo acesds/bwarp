@@ -67,6 +67,16 @@ GpuStatus gpuDecompress(const uint8_t*, size_t, std::vector<uint8_t>&, GpuDecode
     return GpuStatus::Unavailable;
 }
 
+GpuStatus gpuDecompress(const uint8_t*, size_t, uint8_t*, size_t, size_t& n, GpuDecodeStats* stats) {
+    n = 0;
+
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
 GpuStatus gpuEncode(const uint8_t*, int32_t, int32_t, const uint32_t*, int, const EncodeParams&, std::vector<uint8_t>&,
     EncodeStats* encodeStats, GpuEncodeStats* stats) {
     if (encodeStats) {

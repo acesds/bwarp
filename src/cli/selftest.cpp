@@ -377,6 +377,22 @@ namespace {
             return;
         }
 
+        // Into a buffer of exactly the text's size, then one byte short of it.
+        if (n > 0) {
+            std::vector<uint8_t> buffer(input.size());
+            size_t size = 0;
+
+            suite.cases++;
+
+            if (gpuDecompress(encoded.data(), encoded.size(), buffer.data(), buffer.size(), size) != GpuStatus::Ok ||
+                size != input.size() || buffer != input ||
+                gpuDecompress(encoded.data(), encoded.size(), buffer.data(), buffer.size() - 1, size) !=
+                    GpuStatus::NotEnoughMemory) {
+                suite.reportFailure(name + " GPU round trip", "decompressing into a buffer", -1);
+                return;
+            }
+        }
+
         if (suite.verbose) {
             printf("  ok   %s GPU (n=%d)\n", name.c_str(), n);
         }

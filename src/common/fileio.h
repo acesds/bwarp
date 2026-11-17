@@ -18,6 +18,9 @@ bool readWholeFile(const char* path, std::vector<uint8_t>& out, size_t padding =
 
 bool writeWholeFile(const char* path, const void* data, size_t size);
 
+// The first size bytes of the file into buffer, without clearing it first: false if the file has fewer.
+bool readFileInto(const char* path, void* buffer, size_t size);
+
 // divsufsort's bwt format as one block, as sadcs writes it: n and the primary index as int32, then the n bytes.
 bool readBwtFile(const char* path, std::vector<uint8_t>& out, int32_t& primary);
 
