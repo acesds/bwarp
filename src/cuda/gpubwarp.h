@@ -18,8 +18,9 @@ enum class GpuStatus {
     Ok,
     Unavailable,
     NotEnoughMemory,
-    Invalid,  // malformed input
-    Failed,   // see gpuLastError()
+    Invalid,           // malformed input
+    Failed,            // see gpuLastError()
+    ChecksumMismatch,  // decompressed, but the text's CRC-32C isn't the one stored: corrupt data
 };
 
 struct GpuDevice {
@@ -97,13 +98,15 @@ struct GpuDecodeStats {
     double rankSeconds = 0.0;   // gpuDecompress(): the inverse BWT's LF
     double chainSeconds = 0.0;  // and its chains
     double downloadSeconds = 0.0;
+    double checkSeconds = 0.0;  // gpuDecompress(): the text's checksum
 };
 
 // Decodes bwarp data, with the same result as decodeBwt().
 GpuStatus gpuDecode(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
     GpuDecodeStats* stats = nullptr);
 
-// Decodes bwarp data and inverts the BWT on the device: the original text.
+// Decodes bwarp data and inverts the BWT on the device: the original text, checked against the stored CRC-32C
+// (ChecksumMismatch if it differs). data is one block.
 GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& text, GpuDecodeStats* stats = nullptr);
 
 // The same into text, of capacity bytes: NotEnoughMemory if the text, n bytes (the header's), doesn't fit.
@@ -125,8 +128,8 @@ struct GpuEncodeStats {
 };
 
 // Encodes as encodeBwt() does, byte for byte. Invalid where encodeBwt() returns false.
-GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
-    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats = nullptr,
+GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples,
+    int recordedLogSample, const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats = nullptr,
     GpuEncodeStats* stats = nullptr);
 
 // ---- Compression -------------------------------------------------------------------------------
@@ -136,8 +139,9 @@ struct GpuCompressStats {
     GpuEncodeStats encode;  // uploadSeconds: handing it over; setupSeconds: also growing the output buffer
 };
 
-// Builds the BWT of text and encodes it, all on the device: the same bytes as gpuBwt() with samples every
-// 2^kAutoMinLogSample positions, then encodeBwt(). out points into the context's page-locked output buffer and
-// stays valid until its next call or its destruction. Invalid where encodeBwt() returns false.
+// Builds the BWT of text, one block, and encodes it, all on the device: the same bytes as gpuBwt() with samples
+// every 2^kAutoMinLogSample positions, then encodeBwt() with the text's CRC-32C, which the CPU computes meanwhile.
+// out points into one of the context's two page-locked output buffers, used in turn: it stays valid during the
+// next call, until the one after or the context's destruction. Invalid where encodeBwt() returns false.
 GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, const EncodeParams& params,
     const uint8_t*& out, size_t& size, EncodeStats* encodeStats = nullptr, GpuCompressStats* stats = nullptr);

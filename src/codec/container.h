@@ -98,6 +98,7 @@ namespace bwarp {
     struct Container {
         Layout layout;
         int32_t primary = 0;
+        uint32_t checksum = 0;  // CRC-32C of the text
         std::vector<uint32_t> samples;
         std::vector<uint64_t> segmentOffsets;  // tables, then the end of the last
         std::vector<uint64_t> sliceOffsets;    // streams, then the end of the last
@@ -108,28 +109,53 @@ namespace bwarp {
         return n == 0 ? row == 0 : row >= 1 && row <= n;
     }
 
-    // False unless the header is valid, the rows in range and the offsets ascend over exactly the rest of the data.
-    inline bool readContainer(const uint8_t* data, size_t size, Container& container) {
-        if (size < kHeaderBytes || get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt ||
-            data[9] != 0 || data[10] != 0 || data[11] != 0) {
+    struct BlockHeader {
+        Layout layout;
+        uint32_t primary = 0;
+        uint32_t checksum = 0;
+    };
+
+    // The fixed kHeaderBytes at a block's start: false unless they are valid. Its index ends at
+    // layout.indexBytes(), with the block's size, the last slice offset, in its last 8 bytes.
+    inline bool readBlockHeader(const uint8_t* data, BlockHeader& header) {
+        if (get32(data) != kMagic || data[4] != kVersion || data[5] != kTransformBwt || data[9] != 0 ||
+            data[10] != 0 || data[11] != 0) {
             return false;
         }
 
         const int logSegment = data[6], logSlice = data[7], logSample = data[8];
-        const uint32_t n = get32(data + 12), primary = get32(data + 16);
+        const uint32_t n = get32(data + 12);
 
-        if (!validParams(logSegment, logSlice, 1, logSample) || n > INT32_MAX || !validRow(primary, n)) {
+        header.primary = get32(data + 16);
+        header.checksum = get32(data + 20);
+
+        if (!validParams(logSegment, logSlice, 1, logSample) || n > kMaxBlockBytes || !validRow(header.primary, n)) {
             return false;
         }
 
-        const Layout layout(n, logSegment, logSlice, logSample);
+        header.layout = Layout(n, logSegment, logSlice, logSample);
+
+        return true;
+    }
+
+    // False unless the header is valid, the rows in range and the offsets ascend over exactly the rest of the data.
+    inline bool readContainer(const uint8_t* data, size_t size, Container& container) {
+        BlockHeader header;
+
+        if (size < kHeaderBytes || !readBlockHeader(data, header)) {
+            return false;
+        }
+
+        const Layout& layout = header.layout;
+        const uint32_t n = layout.n;
 
         if (size < layout.indexBytes()) {
             return false;
         }
 
         container.layout = layout;
-        container.primary = static_cast<int32_t>(primary);
+        container.primary = static_cast<int32_t>(header.primary);
+        container.checksum = header.checksum;
         container.samples.resize(layout.samples);
         container.segmentOffsets.resize(layout.segments + 1);
         container.sliceOffsets.resize(layout.slices + 1);

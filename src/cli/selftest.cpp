@@ -10,13 +10,18 @@
 #include "selftest.h"
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 #include "checker.h"
+#include "container.h"
 #include "cpucodec.h"
+#include "crc32c.h"
+#include "fileio.h"
 #include "format.h"
 #include "gpubwarp.h"
 
@@ -161,16 +166,87 @@ namespace {
         }
     }
 
+    // ---- checksum ------------------------------------------------------------------------------
+
+    uint32_t crc32cBitwise(const uint8_t* p, size_t size) {
+        uint32_t c = ~0u;
+
+        for (size_t i = 0; i < size; i++) {
+            c ^= p[i];
+
+            for (int k = 0; k < 8; k++) {
+                c = c & 1 ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+            }
+        }
+
+        return ~c;
+    }
+
+    // Against the bit-by-bit definition at every alignment and around the striped loop's threshold, then a large
+    // input, split over threads, against its parts chained.
+    void runChecksumCases(Suite& suite) {
+        printf("selftest: CRC-32C...\n");
+
+        Rng rng{11};
+        const std::vector<uint8_t> data = randomText(rng, 100000, 256);
+
+        suite.cases++;
+
+        if (crc32c("123456789", 9) != 0xE3069283u) {
+            suite.reportFailure("CRC-32C, \"123456789\"", "differs from the check value", -1);
+        }
+
+        for (const size_t start : {0, 1, 3, 7}) {
+            for (const size_t size : {0, 1, 7, 8, 9, 100, 4095, 12287, 12288, 12289, 12300, 40000, 99990}) {
+                const uint8_t* p = data.data() + start;
+                const size_t split = size / 3;
+                const uint32_t whole = crc32c(p, size);
+
+                suite.cases++;
+
+                if (whole != crc32cBitwise(p, size) || crc32c(p + split, size - split, crc32c(p, split)) != whole ||
+                    crc32cCombine(crc32c(p, split), crc32c(p + split, size - split), size - split) != whole) {
+                    suite.reportFailure("CRC-32C, " + std::to_string(size) + " bytes at " + std::to_string(start),
+                        "differs from the definition", -1);
+                }
+            }
+        }
+
+        std::vector<uint8_t> large((size_t(40) << 20) + 13);
+
+        for (size_t i = 0; i < large.size(); i += 8) {
+            const uint64_t v = rng.next();
+            memcpy(large.data() + i, &v, std::min<size_t>(8, large.size() - i));
+        }
+
+        uint32_t chained = 0;
+
+        for (size_t at = 1; at < large.size(); at += size_t(1) << 20) {
+            chained = crc32c(large.data() + at, std::min(size_t(1) << 20, large.size() - at), chained);
+        }
+
+        suite.cases++;
+
+        if (crc32c(large.data() + 1, large.size() - 1) != chained) {
+            suite.reportFailure("CRC-32C, 40 MiB on threads", "differs from its parts chained", -1);
+        }
+    }
+
     // ---- codec ---------------------------------------------------------------------------------
 
     // The GPU decoder must accept exactly what the CPU decoder accepts, with the same result, and so must the
-    // GPU decompressor, whose output must have the same size.
+    // GPU decompressor, whose output must have the same size. The CPU decoder doesn't invert the BWT, so the
+    // decompressor's checksum mismatches count as accepted.
     bool sameAsCpu(const std::vector<uint8_t>& encoded, size_t size) {
         std::vector<uint8_t> cpu, gpu, text;
         int32_t cpuPrimary = -1, gpuPrimary = -1;
         const bool cpuOk = decodeBwt(encoded.data(), size, cpu, cpuPrimary);
         const GpuStatus status = gpuDecode(encoded.data(), size, gpu, gpuPrimary);
-        const GpuStatus inverseStatus = gpuDecompress(encoded.data(), size, text);
+        GpuStatus inverseStatus = gpuDecompress(encoded.data(), size, text);
+
+        if (inverseStatus == GpuStatus::ChecksumMismatch) {
+            inverseStatus = GpuStatus::Ok;
+        }
 
         for (const GpuStatus st : {status, inverseStatus}) {
             if (st != GpuStatus::Ok && st != GpuStatus::Invalid) {
@@ -203,13 +279,18 @@ namespace {
 
         suite.cases++;
 
-        if (!encodeBwt(input.data(), n, inputPrimary, samples.data(), bwarp::kMinLogSample, params, encoded)) {
+        // Not a BWT either, so any checksum will do: decodeBwt() only passes it on.
+        const uint32_t checksum = crc32c(input.data(), input.size());
+
+        if (!encodeBwt(input.data(), n, inputPrimary, checksum, samples.data(), bwarp::kMinLogSample, params,
+                encoded)) {
             suite.reportFailure(label, "encoder refused", -1);
             return;
         }
 
-        bool same = decodeBwt(encoded.data(), encoded.size(), decoded, primary, &decodedSamples) &&
-                    primary == inputPrimary && decoded == input;
+        uint32_t decodedChecksum = 0;
+        bool same = decodeBwt(encoded.data(), encoded.size(), decoded, primary, &decodedSamples, &decodedChecksum) &&
+                    primary == inputPrimary && decoded == input && decodedChecksum == checksum;
         const int logSample = encoded.size() > 8 ? encoded[8] : 0;
 
         for (size_t j = 0; same && j < decodedSamples.size(); j++) {
@@ -227,7 +308,7 @@ namespace {
         }
 
         if (std::vector<uint8_t> gpuEncoded;
-            gpu && (gpuEncode(input.data(), n, inputPrimary, samples.data(), bwarp::kMinLogSample, params,
+            gpu && (gpuEncode(input.data(), n, inputPrimary, checksum, samples.data(), bwarp::kMinLogSample, params,
                         gpuEncoded) != GpuStatus::Ok ||
                        gpuEncoded != encoded)) {
             suite.reportFailure(label, "GPU encoder differs", -1);
@@ -304,6 +385,138 @@ namespace {
         }
     }
 
+    // ---- commands ------------------------------------------------------------------------------
+
+    namespace fs = std::filesystem;
+
+    // Runs "bwarp <args>": true if it succeeded.
+    bool runArgs(CommandRunner command, std::vector<std::string> args) {
+        std::vector<char*> argv;
+
+        args.insert(args.begin(), "bwarp");
+
+        for (std::string& arg : args) {
+            argv.push_back(arg.data());
+        }
+
+        return command(static_cast<int>(argv.size()), argv.data()) == 0;
+    }
+
+    bool fileIs(const fs::path& path, const std::vector<uint8_t>& expected) {
+        std::vector<uint8_t> bytes;
+        return readWholeFile(path.string().c_str(), bytes) && bytes == expected;
+    }
+
+    // compress and decompress on a directory of temporary files, in blocks of 1 GiB and of 64 KiB (several per file,
+    // one file exactly two), then the failures: an existing output, a wrong checksum in a later block, a truncation.
+    // Failed outputs must be gone.
+    void runCommandCases(Suite& suite, CommandRunner command) {
+        GpuDevice device;
+
+        if (gpuQueryDevice(device) != GpuStatus::Ok) {
+            printf("selftest: command cases skipped (%s)\n", gpuLastError());
+            return;
+        }
+
+        printf("selftest: compress and decompress commands on temporary files (errors below are expected)...\n");
+
+        std::error_code error;
+        const fs::path root = fs::temp_directory_path(error) /
+                              ("bwarp-selftest-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        Rng rng{7};
+        std::vector<uint8_t> runs;
+
+        while (runs.size() < 200000) {
+            runs.insert(runs.end(), 1 + rng.nextBelow(300), static_cast<uint8_t>('a' + rng.nextBelow(3)));
+        }
+
+        const std::vector<std::pair<std::string, std::vector<uint8_t>>> files = {
+            {"empty", {}},
+            {"one", textOf("a")},
+            {"text", randomText(rng, 300000, 26)},
+            {"sub/runs", runs},
+            {"sub/exact", periodicText(rng, 131072, 33)},
+        };
+
+        bool ok = fs::create_directories(root / "in" / "sub", error);
+
+        for (const auto& [name, bytes] : files) {
+            ok = ok && writeWholeFile((root / "in" / name).string().c_str(), bytes.data(), bytes.size());
+        }
+
+        if (!ok) {
+            suite.cases++;
+            suite.reportFailure("commands", "cannot write the temporary files", -1);
+            fs::remove_all(root, error);
+            return;
+        }
+
+        const std::string in = (root / "in").string(), packed = (root / "packed").string(),
+                          out = (root / "out").string();
+
+        for (const char* block : {"1073741824", "65536"}) {
+            const std::string label = std::string("commands, blocks of ") + block;
+
+            suite.cases++;
+
+            if (!runArgs(command, {"compress", in, packed, "--recursive", "--force", "--quiet", "--block", block}) ||
+                !runArgs(command, {"decompress", packed, out, "--recursive", "--force", "--quiet"})) {
+                suite.reportFailure(label, "a command failed", -1);
+                continue;
+            }
+
+            for (const auto& [name, bytes] : files) {
+                if (!fileIs(root / "out" / name, bytes)) {
+                    suite.reportFailure(label + ", " + name, "round trip differs", -1);
+                }
+            }
+
+            if (suite.verbose) {
+                printf("  ok   %s\n", label.c_str());
+            }
+        }
+
+        // packed holds blocks of 64 KiB: text.bwarp five of them.
+        const fs::path text = root / "packed" / "text.bwarp", broken = root / "broken.bwarp", result = root / "result";
+        std::vector<uint8_t> bytes;
+        bwarp::BlockHeader header;
+
+        suite.cases++;
+
+        if (runArgs(command, {"compress", in, packed, "--recursive", "--quiet"})) {
+            suite.reportFailure("commands, existing outputs", "overwritten without --force", -1);
+        }
+
+        suite.cases++;
+
+        if (!readWholeFile(text.string().c_str(), bytes) || bytes.size() < bwarp::kHeaderBytes ||
+            !bwarp::readBlockHeader(bytes.data(), header)) {
+            suite.reportFailure("commands, wrong checksum", "cannot read the compressed file", -1);
+        } else {
+            // The second block's checksum.
+            const size_t second = bwarp::get64(bytes.data() + header.layout.indexBytes() - 8);
+            std::vector<uint8_t> wrong = bytes;
+
+            wrong[second + 20] ^= 0x10;
+
+            if (!writeWholeFile(broken.string().c_str(), wrong.data(), wrong.size()) ||
+                runArgs(command, {"decompress", broken.string(), result.string(), "--quiet"}) || fs::exists(result)) {
+                suite.reportFailure("commands, wrong checksum", "not refused, or the output left", -1);
+            }
+
+            suite.cases++;
+            bytes.pop_back();
+
+            if (!writeWholeFile(broken.string().c_str(), bytes.data(), bytes.size()) ||
+                runArgs(command, {"decompress", broken.string(), result.string(), "--quiet", "--force"}) ||
+                fs::exists(result)) {
+                suite.reportFailure("commands, truncated", "not refused, or the output left", -1);
+            }
+        }
+
+        fs::remove_all(root, error);
+    }
+
     // ---- GPU -----------------------------------------------------------------------------------
 
     // The construction, checked, then compressed and decompressed on the GPU.
@@ -331,17 +544,19 @@ namespace {
         }
 
         std::vector<uint8_t> encoded, text;
+        const uint32_t checksum = crc32c(input.data(), input.size());
 
         suite.cases++;
 
-        if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, params, encoded)) {
+        if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, checksum, samples.data(), params.logSample, params,
+                encoded)) {
             suite.reportFailure(name + " GPU round trip", "encoder refused", -1);
             return;
         }
 
         if (std::vector<uint8_t> gpuEncoded;
-            gpuEncode(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, params, gpuEncoded) !=
-                GpuStatus::Ok ||
+            gpuEncode(bwt.bytes.data(), n, bwt.primary, checksum, samples.data(), params.logSample, params,
+                gpuEncoded) != GpuStatus::Ok ||
             gpuEncoded != encoded) {
             suite.reportFailure(name + " GPU round trip", "GPU encoder differs", -1);
             return;
@@ -358,7 +573,8 @@ namespace {
             automatic.logSample = 0;
             suite.cases++;
 
-            if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, automatic, expected) ||
+            if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, checksum, samples.data(), params.logSample, automatic,
+                    expected) ||
                 gpuCompress(context, input.data(), n, automatic, compressed, size) != GpuStatus::Ok ||
                 size != expected.size() || !std::equal(compressed, compressed + size, expected.begin())) {
                 suite.reportFailure(name + " GPU compression", "differs from the CPU encoder", -1);
@@ -374,6 +590,17 @@ namespace {
         if (text != input) {
             const auto diff = std::mismatch(text.begin(), text.end(), input.begin(), input.end());
             suite.reportFailure(name + " GPU round trip", "text differs", diff.first - text.begin());
+            return;
+        }
+
+        // A stored checksum one bit off.
+        std::vector<uint8_t> wrong = encoded;
+
+        wrong[20] ^= 1;
+        suite.cases++;
+
+        if (gpuDecompress(wrong.data(), wrong.size(), text) != GpuStatus::ChecksumMismatch) {
+            suite.reportFailure(name + " GPU round trip", "wrong checksum not caught", -1);
             return;
         }
 
@@ -486,13 +713,15 @@ namespace {
     }
 }
 
-int runSelfTest(bool verbose) {
+int runSelfTest(bool verbose, CommandRunner command) {
     Suite suite{verbose};
 
     printf("selftest: checker on known BWTs and planted errors...\n");
     runCheckerCases(suite);
+    runChecksumCases(suite);
     runCodecCases(suite);
     runGpuCases(suite);
+    runCommandCases(suite, command);
 
     printf("selftest: %d of %d cases passed\n", suite.cases - suite.failures, suite.cases);
 

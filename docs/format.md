@@ -1,8 +1,8 @@
 # bwarp format, version 0
 
-A bwarp file holds the BWT of one block of up to 2^31 − 1 bytes. All integers are little-endian. `src/codec/format.h` has the constants and coding primitives; `src/codec/cpucodec.cpp` is the reference implementation.
+A bwarp file is a series of blocks, one after another with nothing between, each holding the BWT of up to 2^30 bytes (1 GiB) of the text: the text is their texts in order. An empty text is one block with n = 0. Each block is self-contained, so blocks decode independently. All integers are little-endian. `src/codec/format.h` has the constants and coding primitives; `src/codec/cpucodec.cpp` is the reference implementation.
 
-## Layout
+## Block layout
 
 | Bytes | Field |
 |---|---|
@@ -13,8 +13,9 @@ A bwarp file holds the BWT of one block of up to 2^31 − 1 bytes. All integers 
 | 1 | logSlice, 10 to 16 |
 | 1 | logSample, 8 to 31 |
 | 3 | zero |
-| 4 | n, the text length |
+| 4 | n, the block's text length, at most 2^30 |
 | 4 | primary, the sentinel's row among the sorted rotations |
+| 4 | checksum, the CRC-32C (Castagnoli, as in iSCSI; of "123456789", 0xE3069283) of the block's text |
 | 4 × samples | sample rows |
 | 8 × (segments + 1) | segment offsets |
 | 8 × (slices + 1) | slice offsets |
@@ -29,7 +30,9 @@ bwarp's encoder picks the smallest logSample in [10, 16] that gives at most 2^13
 
 It is cut into slices of 2^logSlice bytes and segments of 2^logSegment bytes (the last of each may be shorter): `slices = ceil(n / 2^logSlice)`, `segments = ceil(n / 2^logSegment)`. Segment g's table models slices [g × 2^(logSegment − logSlice), …).
 
-Offsets are absolute file positions. Table g occupies [segment offset g, g + 1), stream s [slice offset s, s + 1). The first segment offset is the end of the slice offsets, the last equals the first slice offset, and the last slice offset is the file size.
+Offsets count from the block's start. Table g occupies [segment offset g, g + 1), stream s [slice offset s, s + 1). The first segment offset is the end of the slice offsets, the last equals the first slice offset, and the last slice offset is the block's size: the next block starts there. A reader finds the blocks from their first 24 bytes, which give the index's size, and the 8 bytes that end it.
+
+The checksum is checked after the inverse BWT: a mismatch means the data is corrupt.
 
 ## Tokens
 

@@ -32,10 +32,12 @@ endif()
 # Source groups -- organized by concept (see README.md, "Where things live").
 # =============================================================================
 
-# Shared by all parts: the BWT checker from sadcs (checker) and file I/O (fileio).
+# Shared by all parts: the BWT checker from sadcs (checker), the blocks' checksum (crc32c) and file I/O (fileio).
 set(COMMON_SOURCES
     src/common/checker.h
     src/common/checker.cpp
+    src/common/crc32c.h
+    src/common/crc32c.cpp
     src/common/fileio.h
     src/common/fileio.cpp
 )

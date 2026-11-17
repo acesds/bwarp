@@ -16,15 +16,16 @@
 // out.size() is the file size plus padding zero bytes.
 bool readWholeFile(const char* path, std::vector<uint8_t>& out, size_t padding = 0);
 
-bool writeWholeFile(const char* path, const void* data, size_t size);
+// append: to the end of an existing file.
+bool writeWholeFile(const char* path, const void* data, size_t size, bool append = false);
 
 // writeWholeFile(), but on Windows past the file cache, about twice as fast for large files (100 MB: 30 ms instead
-// of 55) and on the disk on return, if data is aligned to 4 KiB (as page-locked memory is) and size at least 32 MiB.
-// Smaller files are faster through the cache.
-bool writeFileDirect(const char* path, const void* data, size_t size);
+// of 55) and on the disk on return, if data is aligned to 4 KiB (as page-locked memory is) and size at least 32 MiB,
+// and when appending, the file's size a multiple of 4 KiB. Smaller files are faster through the cache.
+bool writeFileDirect(const char* path, const void* data, size_t size, bool append = false);
 
-// The first size bytes of the file into buffer, without clearing it first: false if the file has fewer.
-bool readFileInto(const char* path, void* buffer, size_t size);
+// size bytes of the file from offset into buffer: false if the file has fewer.
+bool readFileInto(const char* path, void* buffer, size_t size, uint64_t offset = 0);
 
 // divsufsort's bwt format as one block, as sadcs writes it: n and the primary index as int32, then the n bytes.
 bool readBwtFile(const char* path, std::vector<uint8_t>& out, int32_t& primary);

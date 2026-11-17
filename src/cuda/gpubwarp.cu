@@ -15,11 +15,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <memory>
 #include <new>
 #include <cuda_runtime.h>
 #include "classsort.cuh"
 #include "container.h"
+#include "crc32c.h"
 #include "decode.cuh"
 #include "encode.cuh"
 #include "inverse.cuh"
@@ -216,7 +219,9 @@ namespace {
         return error == cudaErrorMemoryAllocation ? GpuStatus::NotEnoughMemory : GpuStatus::Failed;
     }
 
-    GpuStatus uploadAndRank(gpusa::Construction& c, Staging& staging, const uint8_t* text, int32_t n, GpuBwtStats& s) {
+    // uploaded, if given, runs once the text is on the device.
+    GpuStatus uploadAndRank(gpusa::Construction& c, Staging& staging, const uint8_t* text, int32_t n, GpuBwtStats& s,
+        const std::function<void()>* uploaded) {
         using namespace gpusa;
 
         cudaError_t error;
@@ -246,6 +251,11 @@ namespace {
         }
 
         s.uploadSeconds = secondsSince(start);
+
+        if (uploaded) {
+            (*uploaded)();
+        }
+
         start = std::chrono::steady_clock::now();
 
         if ((error = SampleRanking(c).run(s)) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
@@ -346,8 +356,9 @@ struct GpuBwtContext {
     cudaMemPool_t pool = nullptr;
     int32_t capacity = 0;
     Staging staging;
-    uint8_t* output = nullptr;  // gpuCompress()'s, page-locked
-    size_t outputCapacity = 0;
+    uint8_t* output[2] = {};  // gpuCompress()'s, page-locked, used in turn
+    size_t outputCapacity[2] = {};
+    int nextOutput = 0;
 
     GpuBwtContext() = default;
     GpuBwtContext(const GpuBwtContext&) = delete;
@@ -360,8 +371,10 @@ struct GpuBwtContext {
             cudaMemPoolDestroy(pool);
         }
 
-        if (output) {
-            cudaFreeHost(output);
+        for (uint8_t* buffer : output) {
+            if (buffer) {
+                cudaFreeHost(buffer);
+            }
         }
     }
 };
@@ -412,7 +425,7 @@ void gpuDestroyBwtContext(GpuBwtContext* context) {
 namespace {
     // Leaves the BWT in output as MergeOutput::Bwt describes it.
     // With samples, also records the rows of text positions j * 2^logSample, j >= 1.
-    GpuStatus buildOnDevice(GpuBwtContext& context, gpusa::Construction& c, const uint8_t* text, int32_t n, GpuBwtStats& s, uint32_t*& lists, uint32_t*& output, gpusa::Merger& merger, uint32_t& suffixZeroRow, uint32_t* samples, int logSample) {
+    GpuStatus buildOnDevice(GpuBwtContext& context, gpusa::Construction& c, const uint8_t* text, int32_t n, GpuBwtStats& s, uint32_t*& lists, uint32_t*& output, gpusa::Merger& merger, uint32_t& suffixZeroRow, uint32_t* samples, int logSample, const std::function<void()>* uploaded = nullptr) {
         using namespace gpusa;
 
         MemoryPlan plan;
@@ -428,7 +441,8 @@ namespace {
             return failed("planning", error);
         }
 
-        if (const GpuStatus status = uploadAndRank(c, context.staging, text, n, s); status != GpuStatus::Ok) {
+        if (const GpuStatus status = uploadAndRank(c, context.staging, text, n, s, uploaded);
+            status != GpuStatus::Ok) {
             return status;
         }
 
@@ -932,6 +946,17 @@ namespace {
 
         s.downloadSeconds = secondsSince(start);
 
+        const auto checking = std::chrono::steady_clock::now();
+        const uint32_t checksum = crc32c(text, n);
+
+        s.checkSeconds = secondsSince(checking);
+
+        if (checksum != d.container.checksum) {
+            snprintf(lastError, sizeof lastError, "the text's CRC-32C is %08x, the block says %08x", checksum,
+                d.container.checksum);
+            return GpuStatus::ChecksumMismatch;
+        }
+
         return GpuStatus::Ok;
     }
 }
@@ -970,8 +995,9 @@ namespace {
     // streams in body, bodyBytes of them, and writes the header, samples and offsets to index. Everything comes
     // from pool. prepare(bodyBytes) runs while the device places the body, which is done on return.
     template <class Prepare>
-    GpuStatus encodeOnDevice(const uint8_t* deviceBwt, int32_t n, int32_t primary, const uint32_t* samples,
-        int recordedLogSample, const EncodeParams& params, cudaMemPool_t pool, DeviceArray<uint8_t>& body,
+    GpuStatus encodeOnDevice(const uint8_t* deviceBwt, int32_t n, int32_t primary, uint32_t checksum,
+        const uint32_t* samples, int recordedLogSample, const EncodeParams& params, cudaMemPool_t pool,
+        DeviceArray<uint8_t>& body,
         uint64_t& bodyBytes, std::vector<uint8_t>& index, EncodeStats& e, GpuEncodeStats& s, Prepare prepare) {
         using namespace bwarp;
 
@@ -1112,7 +1138,7 @@ namespace {
                 coding.logSegment, coding.logSlice, tables.get(), codes.get(), to);
         }
 
-        writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, index, e);
+        writeIndex(n, primary, checksum, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, index, e);
         e.tokens = static_cast<int64_t>(tokenCount);
 
         if ((error = cudaGetLastError()) != cudaSuccess) {
@@ -1134,8 +1160,9 @@ namespace {
     }
 }
 
-GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
-    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats, GpuEncodeStats* stats) {
+GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples,
+    int recordedLogSample, const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats,
+    GpuEncodeStats* stats) {
     using namespace bwarp;
 
     lastError[0] = '\0';
@@ -1158,7 +1185,7 @@ GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32
         const Layout coding(0, params.logSegment, params.logSlice, kMaxLogSample);
         const std::vector<uint64_t> segmentOffsets(coding.segments + 1, 0), sliceOffsets(coding.slices + 1, 0);
 
-        writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
+        writeIndex(n, primary, checksum, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
         return GpuStatus::Ok;
     }
 
@@ -1184,8 +1211,8 @@ GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32
     s.uploadSeconds = secondsSince(start);
 
     // While the device places the body, the host makes room for it.
-    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, samples, recordedLogSample, params,
-        pool.get(), body, bodyBytes, out, e, s, [&](uint64_t bytes) {
+    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, checksum, samples, recordedLogSample,
+        params, pool.get(), body, bodyBytes, out, e, s, [&](uint64_t bytes) {
             out.resize(out.size() + bytes);
             return GpuStatus::Ok;
         });
@@ -1218,18 +1245,18 @@ namespace {
         }
     }
 
-    // Grows the context's page-locked output buffer to at least bytes, with some room to spare.
-    GpuStatus reserveOutput(GpuBwtContext& context, size_t bytes) {
-        if (bytes <= context.outputCapacity) {
+    // Grows the context's page-locked output buffer b to at least bytes, with some room to spare.
+    GpuStatus reserveOutput(GpuBwtContext& context, int b, size_t bytes) {
+        if (bytes <= context.outputCapacity[b]) {
             return GpuStatus::Ok;
         }
 
-        gpuFreePinned(context.output);
-        context.outputCapacity = bytes + bytes / 8;
-        context.output = static_cast<uint8_t*>(gpuAllocatePinned(context.outputCapacity));
+        gpuFreePinned(context.output[b]);
+        context.outputCapacity[b] = bytes + bytes / 8;
+        context.output[b] = static_cast<uint8_t*>(gpuAllocatePinned(context.outputCapacity[b]));
 
-        if (!context.output) {
-            context.outputCapacity = 0;
+        if (!context.output[b]) {
+            context.outputCapacity[b] = 0;
             snprintf(lastError, sizeof lastError, "out of page-locked host memory");
             return GpuStatus::NotEnoughMemory;
         }
@@ -1259,8 +1286,8 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
         return GpuStatus::Invalid;
     }
 
-    // The parameters, before building anything: as for an empty input, which has no rows to check.
-    if (n < 0 || !validEncodeInput(0, 0, nullptr, kAutoMinLogSample, params)) {
+    // The size and parameters, before building anything: as for an empty input, which has no rows to check.
+    if (n < 0 || uint32_t(n) > kMaxBlockBytes || !validEncodeInput(0, 0, nullptr, kAutoMinLogSample, params)) {
         snprintf(lastError, sizeof lastError, "invalid encoding parameters");
         return GpuStatus::Invalid;
     }
@@ -1268,6 +1295,9 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
     std::vector<uint32_t> samples(sampleCount(static_cast<uint32_t>(n), kAutoMinLogSample));
     std::vector<uint8_t> index;
     int32_t primary = 0;
+    const int b = context->nextOutput;
+
+    context->nextOutput ^= 1;
 
     // Too small to build on the device: gpuBwt() and gpuEncode().
     if (n <= 1) {
@@ -1275,18 +1305,24 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
         GpuStatus status;
 
         if ((status = gpuBwt(context, text, n, &bwt, primary, &s.bwt)) != GpuStatus::Ok ||
-            (status = gpuEncode(&bwt, n, primary, samples.data(), kAutoMinLogSample, params, index, &e,
-                 &s.encode)) != GpuStatus::Ok ||
-            (status = reserveOutput(*context, index.size())) != GpuStatus::Ok) {
+            (status = gpuEncode(&bwt, n, primary, crc32c(text, size_t(n)), samples.data(), kAutoMinLogSample, params,
+                 index, &e, &s.encode)) != GpuStatus::Ok ||
+            (status = reserveOutput(*context, b, index.size())) != GpuStatus::Ok) {
             return status;
         }
 
-        memcpy(context->output, index.data(), index.size());
-        out = context->output;
+        memcpy(context->output[b], index.data(), index.size());
+        out = context->output[b];
         size = index.size();
 
         return GpuStatus::Ok;
     }
+
+    // The checksum on the CPU while the device builds the BWT, after the upload, which it would slow down.
+    std::future<uint32_t> checksum;
+    const std::function<void()> uploaded = [&] {
+        checksum = std::async(std::launch::async, [=] { return crc32c(text, size_t(n)); });
+    };
 
     DeviceArray<uint8_t> deviceBwt, body;  // from the context's pool, which outlives them
     cudaError_t error;
@@ -1301,7 +1337,7 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
         uint32_t row = 0;
 
         if (const GpuStatus status = buildOnDevice(*context, c, text, n, s.bwt, lists, output, merger, row,
-                samples.data(), kAutoMinLogSample);
+                samples.data(), kAutoMinLogSample, &uploaded);
             status != GpuStatus::Ok) {
             return status;
         }
@@ -1332,15 +1368,15 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
 
     // While the device places the body, the host copies the index into the output buffer.
     uint64_t bodyBytes = 0;
-    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, samples.data(), kAutoMinLogSample, params,
-        context->pool, body, bodyBytes, index, e, s.encode, [&](uint64_t bytes) {
+    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, checksum.get(), samples.data(),
+        kAutoMinLogSample, params, context->pool, body, bodyBytes, index, e, s.encode, [&](uint64_t bytes) {
             const auto growing = std::chrono::steady_clock::now();
-            const GpuStatus reserved = reserveOutput(*context, index.size() + bytes);
+            const GpuStatus reserved = reserveOutput(*context, b, index.size() + bytes);
 
             s.encode.setupSeconds += secondsSince(growing);
 
             if (reserved == GpuStatus::Ok) {
-                memcpy(context->output, index.data(), index.size());
+                memcpy(context->output[b], index.data(), index.size());
             }
 
             return reserved;
@@ -1352,13 +1388,13 @@ GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, co
 
     start = std::chrono::steady_clock::now();
 
-    if ((error = cudaMemcpy(context->output + index.size(), body.get(), bodyBytes, cudaMemcpyDeviceToHost)) !=
+    if ((error = cudaMemcpy(context->output[b] + index.size(), body.get(), bodyBytes, cudaMemcpyDeviceToHost)) !=
         cudaSuccess) {
         return failed("download", error);
     }
 
     s.encode.downloadSeconds = secondsSince(start);
-    out = context->output;
+    out = context->output[b];
     size = index.size() + bodyBytes;
 
     return GpuStatus::Ok;

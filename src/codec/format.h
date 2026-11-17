@@ -25,7 +25,9 @@ namespace bwarp {
     constexpr uint32_t kMagic = 0x50525742;  // "BWRP"
     constexpr uint8_t kVersion = 0;
     constexpr uint8_t kTransformBwt = 0;
-    constexpr int kHeaderBytes = 20;
+    constexpr int kHeaderBytes = 24;
+    constexpr uint32_t kMaxLogBlock = 30;
+    constexpr uint32_t kMaxBlockBytes = 1u << kMaxLogBlock;  // a file is a series of blocks of at most 1 GiB
 
     constexpr int kLanes = 32;
     constexpr int kMinLogSlice = 10;

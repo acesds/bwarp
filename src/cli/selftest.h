@@ -9,5 +9,8 @@
 
 #pragma once
 
-// Returns the number of failures.
-int runSelfTest(bool verbose);
+// Runs a command line as main() gets it: an exit code.
+using CommandRunner = int (*)(int argc, char** argv);
+
+// Returns the number of failures. command runs the compress and decompress commands on temporary files.
+int runSelfTest(bool verbose, CommandRunner command);

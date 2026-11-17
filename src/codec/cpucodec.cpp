@@ -519,7 +519,8 @@ int chooseLogSample(uint32_t n, uint64_t codedBytes, int recordedLogSample) {
 
 bool validEncodeInput(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
     const EncodeParams& params) {
-    if (n < 0 || !validParams(params.logSegment, params.logSlice, params.contexts, kMaxLogSample) ||
+    if (n < 0 || uint32_t(n) > kMaxBlockBytes ||
+        !validParams(params.logSegment, params.logSlice, params.contexts, kMaxLogSample) ||
         recordedLogSample < kMinLogSample || recordedLogSample > kMaxLogSample ||
         (params.logSample != 0 && (params.logSample < recordedLogSample || params.logSample > kMaxLogSample)) ||
         !validRow(static_cast<uint32_t>(primary), static_cast<uint32_t>(n))) {
@@ -535,9 +536,9 @@ bool validEncodeInput(int32_t n, int32_t primary, const uint32_t* samples, int r
     return true;
 }
 
-void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample, const EncodeParams& params,
-    const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets, std::vector<uint8_t>& out,
-    EncodeStats& s) {
+void writeIndex(int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets,
+    std::vector<uint8_t>& out, EncodeStats& s) {
     const uint64_t bodyBytes = sliceOffsets.back();
     const int logSample = params.logSample != 0
                               ? params.logSample
@@ -553,6 +554,7 @@ void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recorde
     out[8] = static_cast<uint8_t>(logSample);
     put32(&out[12], layout.n);
     put32(&out[16], static_cast<uint32_t>(primary));
+    put32(&out[20], checksum);
 
     // Position j * 2^logSample is recorded sample j * 2^(logSample - recorded) - 1.
     for (uint32_t j = 0; j < layout.samples; j++) {
@@ -578,8 +580,8 @@ void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recorde
     s.streamBytes = static_cast<int64_t>(sliceOffsets.back() - sliceOffsets.front());
 }
 
-bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
-    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats) {
+bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples,
+    int recordedLogSample, const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats) {
     EncodeStats local;
     EncodeStats& s = stats ? *stats : local;
 
@@ -627,7 +629,7 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* s
 
     const int64_t tokens = s.tokens;
 
-    writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, s);
+    writeIndex(n, primary, checksum, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, s);
     out.insert(out.end(), body.begin(), body.end());
     s.tokens = tokens;
 
@@ -635,7 +637,7 @@ bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* s
 }
 
 bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
-    std::vector<uint32_t>* samples) {
+    std::vector<uint32_t>* samples, uint32_t* checksum) {
     Container container;
 
     if (!readContainer(data, size, container)) {
@@ -654,6 +656,10 @@ bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int3
 
     if (samples) {
         *samples = container.samples;
+    }
+
+    if (checksum) {
+        *checksum = container.checksum;
     }
 
     for (uint32_t g = 0; g < layout.segments; g++) {

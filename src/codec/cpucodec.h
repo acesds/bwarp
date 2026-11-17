@@ -42,21 +42,23 @@ struct EncodeStats {
     int logSample = 0;
 };
 
-// samples: sampleCount(n, recordedLogSample) rows, those of text positions j * 2^recordedLogSample for j >= 1,
-// as gpuBwt() records them; the file keeps every 2^(params.logSample - recordedLogSample)-th. False if params or
-// rows are out of range.
-bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
-    const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats = nullptr);
+// One block of at most kMaxBlockBytes: the BWT of a text whose CRC-32C is checksum (see crc32c.h), stored for
+// the decompressor to check. samples: sampleCount(n, recordedLogSample) rows, those of text positions
+// j * 2^recordedLogSample for j >= 1, as gpuBwt() records them; the file keeps every
+// 2^(params.logSample - recordedLogSample)-th. False if n, params or rows are out of range.
+bool encodeBwt(const uint8_t* bwt, int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples,
+    int recordedLogSample, const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* stats = nullptr);
 
 // For other encoders: whether encodeBwt() accepts the input, and the header, samples and offsets it writes before
 // the tables and streams, given their offsets relative to the first table (the last slice offset is their size).
 // Sets s's logSample, indexBytes, tableBytes and streamBytes.
 bool validEncodeInput(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
     const EncodeParams& params);
-void writeIndex(int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample, const EncodeParams& params,
-    const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets, std::vector<uint8_t>& out,
-    EncodeStats& s);
+void writeIndex(int32_t n, int32_t primary, uint32_t checksum, const uint32_t* samples, int recordedLogSample,
+    const EncodeParams& params, const std::vector<uint64_t>& segmentOffsets, const std::vector<uint64_t>& sliceOffsets,
+    std::vector<uint8_t>& out, EncodeStats& s);
 
-// False on malformed input.
+// One block: false on malformed input. The checksum is that of the text, which the BWT doesn't give, so it is
+// only passed on.
 bool decodeBwt(const uint8_t* data, size_t size, std::vector<uint8_t>& bwt, int32_t& primary,
-    std::vector<uint32_t>* samples = nullptr);
+    std::vector<uint32_t>* samples = nullptr, uint32_t* checksum = nullptr);

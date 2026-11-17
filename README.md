@@ -10,7 +10,7 @@ What exists so far:
 
 - The build: clang-cl or MSVC for the C++ sources, nvcc for the GPU variant.
 - sadcs's GPU BWT construction and its BWT checker, BWT path only (see [From sadcs](#from-sadcs)).
-- Format v0 ([docs/format.md](docs/format.md)) with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
+- Format v0 ([docs/format.md](docs/format.md)): a series of self-contained blocks of up to 1 GiB, each with the CRC-32C of its text, with a sequential CPU reference encoder and decoder. It is the ratio prototype and the oracle the GPU coder must match byte for byte.
 - The GPU decoder, byte for byte the same as the CPU one, valid input or not.
 - The GPU inverse BWT, so decompression runs entirely on the device: LF from a stable ranking of the BWT, then one chain per sampled row that the construction records, walked backward (from both ends, with psi too, when there are few).
 - The command line and a selftest.
@@ -25,8 +25,8 @@ bwarp bwt <in> <out.bwt>
 bwarp check <in> <in.bwt>
 bwarp test <in|dir> [--recursive]
 bwarp bench <in|dir> [--runs N] [--context] [--pinned] [--recursive]
-bwarp compress <in> [<out>] | <dir> <outdir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--recursive] [--force] [--verbose]
-bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force] [--verbose]
+bwarp compress <in> [<out>] | <dir> <outdir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--block BYTES] [--recursive] [--force] [--quiet | --verbose]
+bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force] [--quiet | --verbose]
 bwarp ratio <in|dir> [--segment LOG2] [--slice LOG2] [--contexts K] [--sample LOG2] [--gpu [--verbose]] [--recursive]
 bwarp selftest [--verbose]
 ```
@@ -38,9 +38,9 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block, the same as `
 - `check`: verify a BWT file against its text by inverting it on the CPU (sequential, about 12 MB/s on enwik8).
 - `test`: build and check in memory, with the GPU's phases and memory. On a directory it runs every file in it (`--recursive` to include subdirectories), one row per file plus a total.
 - `bench`: time the GPU build, the best of `--runs` (default 5) after a warmup, with each phase. `--context` reuses one GPU context per file, `--pinned` uses page-locked host buffers. `--context --pinned` measures the way libcubwt's benchmark does.
-- `compress`: compress on the GPU, BWT and encoder without a round trip through the host, into `<in>.bwarp` unless `<out>` is given; a directory's files go to the same names plus `.bwarp` under `<outdir>`. The encoding options are those of `ratio`. `decompress` does the reverse, of a directory's `.bwarp` files. Both read the next file while the GPU works on the current one, into page-locked buffers (`decompress` also writes the previous one meanwhile), write files of 32 MiB and more past the Windows file cache, which is about twice as fast for them, refuse to overwrite files without `--force`, and print each file's speed and the totals with reading and writing; `--verbose` adds the phases.
+- `compress`: compress on the GPU, BWT and encoder without a round trip through the host, into `<in>.bwarp` unless `<out>` is given; a directory's files go to the same names plus `.bwarp` under `<outdir>`. The encoding options are those of `ratio`; `--block` (default and at most 2^30, 1 GiB, so enwik9 is one block) sets the block size. Each block stores the CRC-32C of its text, computed on the CPU while the GPU builds the BWT. `decompress` does the reverse, of a directory's `.bwarp` files, and checks each block's checksum. Both read the first block while they set up, then the next block while the GPU works on the current one, into page-locked buffers, and write the previous one meanwhile; they write blocks of 32 MiB and more past the Windows file cache, which is about twice as fast for them, refuse to overwrite files without `--force`, remove the output of a file that fails, and print each file's speed and the totals with setup, reading and writing, also in ns/byte as the Large Text Compression Benchmark reports it. `--quiet` prints only errors; `--verbose` adds each block's phases.
 - `ratio`: build the BWT on the GPU, encode and decode it with the CPU reference codec, check the round trip and print the compressed size, bits per byte, runs per byte, the share of tables and index, and the CPU coding speeds. `--segment` (default 15) sets the frequency tables per 2^LOG2 bytes, `--slice` (default 15, 10 to 16) one 32-lane rANS stream per 2^LOG2 bytes, `--contexts` (default 16, 1 to 16) the most symbol contexts a table may use, `--sample` (default automatic, 10 to 31) an inverse BWT chain per 2^LOG2 bytes. `--gpu` also encodes and decompresses on the GPU, checks both, and prints their speeds without transfers (the faster of two runs), that of the stream kernel and that of the inverse BWT. It also runs the whole compression on the GPU, BWT and encoder without a round trip through the host, checks it against the CPU encoder and prints its speed host to host (`gcmp`); `--verbose` adds each phase, and the time of building the BWT and encoding it as two calls.
-- `selftest`: the checker on known BWTs and planted errors, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder and decompressor must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker and then compressed and decompressed on the GPU (GPU cases skipped without a device).
+- `selftest`: the checker on known BWTs and planted errors, CRC-32C against its definition, codec round trips over several parameter sets with truncated and corrupted copies (the GPU decoder and decompressor must accept exactly what the CPU decoder accepts, with the same result), and the GPU construction on adversarial inputs, verified by the checker and then compressed and decompressed on the GPU, and `compress` and `decompress` on temporary files in one and in several blocks, with an existing output, a wrong checksum and a truncated file (GPU cases skipped without a device).
 
 ## From sadcs
 
@@ -88,7 +88,7 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 
 - `src/cuda/`: the GPU variant; its interface is `gpubwarp.h`. Builds without CUDA use `gpubwarp_stub.cpp` instead. `decode.cuh` holds the decoder kernels, `inverse.cuh` the inverse BWT.
 - `src/codec/`: the format (`format.h`), table coding (`table.h`) and container (`container.h`), shared by CPU and GPU, and the CPU reference codec.
-- `src/common/`: the BWT checker and file I/O.
+- `src/common/`: the BWT checker, CRC-32C (SSE4.2, on several threads for large inputs) and file I/O.
 - `src/cli/`: the command line and the selftest.
 - `docs/`: the design records, starting with [handoff.md](docs/handoff.md), and the [format](docs/format.md).
 

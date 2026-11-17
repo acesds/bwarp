@@ -22,6 +22,7 @@
 #include "checker.h"
 #include "container.h"
 #include "cpucodec.h"
+#include "crc32c.h"
 #include "format.h"
 #include "fileio.h"
 #include "gpubwarp.h"
@@ -43,6 +44,8 @@ namespace {
         bool pinned = false;
         bool gpu = false;
         bool force = false;
+        bool quiet = false;
+        int64_t blockBytes = bwarp::kMaxBlockBytes;
         EncodeParams encode;
     };
 
@@ -73,8 +76,9 @@ namespace {
             "\n"
             "usage:\n"
             "  bwarp compress <in> [<out>] | <dir> <outdir> [--segment LOG2] [--slice LOG2] [--contexts K]\n"
-            "              [--sample LOG2] [--recursive] [--force] [--verbose]\n"
-            "  bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force] [--verbose]\n"
+            "              [--sample LOG2] [--block BYTES] [--recursive] [--force] [--quiet | --verbose]\n"
+            "  bwarp decompress <in.bwarp> [<out>] | <dir> <outdir> [--recursive] [--force]\n"
+            "              [--quiet | --verbose]\n"
             "  bwarp info\n"
             "  bwarp bwt <in> <out.bwt>\n"
             "  bwarp check <in> <in.bwt>\n"
@@ -86,8 +90,13 @@ namespace {
             "\n"
             "compress compresses on the GPU, BWT and encoder, into <in>.bwarp unless <out> is given; a\n"
             "directory's files go to the same names plus .bwarp under <outdir>. decompress does the\n"
-            "reverse, of a directory's .bwarp files. Both read the next file while the GPU works on\n"
-            "the current one and refuse to overwrite files without --force; --verbose adds the phases.\n"
+            "reverse, of a directory's .bwarp files. A file is compressed in blocks of --block bytes,\n"
+            "at most and by default 2^30 (1 GiB), each with the CRC-32C of its text, which decompress\n"
+            "checks. Both read the next block while the GPU works on the current one and write the\n"
+            "one before meanwhile, refuse to overwrite files without --force and remove incomplete\n"
+            "outputs. Their times include the setup before the first file, as a whole run's would\n"
+            "(ns/byte: as the Large Text Compression Benchmark reports). --quiet prints only errors;\n"
+            "--verbose adds each block's phases.\n"
             "The .bwt file is divsufsort's bwt format as one block: n, the primary index, the n bytes\n"
             "(the same as sadcs build --bwt).\n"
             "info prints the GPU, or that bwarp was built without CUDA.\n"
@@ -134,6 +143,15 @@ namespace {
                 options.context = true;
             } else if (strcmp(arg, "--gpu") == 0) {
                 options.gpu = true;
+            } else if (strcmp(arg, "--block") == 0 && i + 1 < argc) {
+                options.blockBytes = strtoll(argv[++i], nullptr, 10);
+
+                if (options.blockBytes < 1 || options.blockBytes > bwarp::kMaxBlockBytes) {
+                    printf("bwarp: --block must be 1 to %u\n", bwarp::kMaxBlockBytes);
+                    return false;
+                }
+            } else if (strcmp(arg, "--quiet") == 0) {
+                options.quiet = true;
             } else if (strcmp(arg, "--force") == 0) {
                 options.force = true;
             } else if (strcmp(arg, "--pinned") == 0) {
@@ -179,13 +197,15 @@ namespace {
         return seconds > 0.0 ? static_cast<double>(bytes) / (1024.0 * 1024.0) / seconds : 0.0;
     }
 
-    bool reportGpu(GpuStatus status) {
+    // where: what failed, as "'file', block 1: ", or nothing.
+    bool reportGpu(GpuStatus status, const std::string& where = "") {
         if (status != GpuStatus::Ok) {
-            printf("bwarp: GPU %s: %s\n",
-                status == GpuStatus::Unavailable       ? "unavailable"
-                : status == GpuStatus::NotEnoughMemory ? "out of memory"
-                : status == GpuStatus::Invalid         ? "rejected the input"
-                                                       : "failed",
+            printf("bwarp: %s%s: %s\n", where.c_str(),
+                status == GpuStatus::Unavailable        ? "GPU unavailable"
+                : status == GpuStatus::NotEnoughMemory  ? "GPU out of memory"
+                : status == GpuStatus::Invalid          ? "input rejected"
+                : status == GpuStatus::ChecksumMismatch ? "corrupt data"
+                                                        : "GPU failed",
                 gpuLastError());
             return false;
         }
@@ -701,6 +721,14 @@ namespace {
                 continue;
             }
 
+            if (uint32_t(n) > bwarp::kMaxBlockBytes) {
+                printf("bwarp: '%s' is larger than a block (2^%u bytes), skipped; compress splits it\n",
+                    files[i].string().c_str(), bwarp::kMaxLogBlock);
+                continue;
+            }
+
+            const uint32_t checksum = crc32c(text.data(), size_t(n));
+
             bwt.resize(n);
             samples.resize(bwarp::sampleCount(static_cast<uint32_t>(n), kAutoMinLogSample));
 
@@ -710,7 +738,8 @@ namespace {
 
             auto start = std::chrono::steady_clock::now();
 
-            if (!encodeBwt(bwt.data(), n, primary, samples.data(), kAutoMinLogSample, params, encoded, &run.stats)) {
+            if (!encodeBwt(bwt.data(), n, primary, checksum, samples.data(), kAutoMinLogSample, params, encoded,
+                    &run.stats)) {
                 printf("bwarp: invalid --segment, --slice or --contexts\n");
                 return kExitError;
             }
@@ -732,8 +761,8 @@ namespace {
             for (int r = 0; options.gpu && ok && r < 2; r++) {
                 std::vector<uint8_t> gpuEncoded;
                 GpuEncodeStats stats;
-                const GpuStatus status = gpuEncode(bwt.data(), n, primary, samples.data(), kAutoMinLogSample, params,
-                    gpuEncoded, nullptr, &stats);
+                const GpuStatus status = gpuEncode(bwt.data(), n, primary, checksum, samples.data(), kAutoMinLogSample,
+                    params, gpuEncoded, nullptr, &stats);
 
                 if (!reportGpu(status)) {
                     ok = false;
@@ -792,8 +821,8 @@ namespace {
 
                     if (!reportGpu(gpuBwt(context, text.data(), n, separateBwt.data(), separatePrimary, nullptr,
                             samples.data(), kAutoMinLogSample)) ||
-                        !reportGpu(gpuEncode(separateBwt.data(), n, separatePrimary, samples.data(), kAutoMinLogSample,
-                            params, separateEncoded))) {
+                        !reportGpu(gpuEncode(separateBwt.data(), n, separatePrimary, crc32c(text.data(), size_t(n)),
+                            samples.data(), kAutoMinLogSample, params, separateEncoded))) {
                         ok = false;
                         break;
                     }
@@ -893,8 +922,22 @@ namespace {
     struct FileJob {
         std::filesystem::path in, out;
         std::string name;
-        int64_t size = 0;  // of the input
-        int64_t n = 0;     // decompressing: the text's, from the header
+        int64_t size = 0;       // of the input
+        int64_t text = 0;       // of the text: compressing, the input's; decompressing, its blocks' together
+        int64_t outBytes = 0;   // written so far
+        double seconds = 0.0;   // in the (de)compression calls
+        bool started = false;   // its output written to
+        bool failed = false;
+    };
+
+    // Compressing, a piece of a file's text, at most --block bytes; decompressing, one of the file's blocks.
+    struct Block {
+        size_t job = 0;
+        int64_t offset = 0;  // in the input
+        int64_t size = 0;
+        int64_t n = 0;  // its text's size
+        int index = 0;  // in its file
+        bool last = false;
     };
 
     bool hasExtension(const std::filesystem::path& path) {
@@ -970,12 +1013,6 @@ namespace {
                 return false;
             }
 
-            if (compressing && job.size > kMaxTextSize) {
-                printf("bwarp: '%s' is too large (%lld bytes, at most %lld supported)\n", file.string().c_str(),
-                    static_cast<long long>(job.size), static_cast<long long>(kMaxTextSize));
-                return false;
-            }
-
             if (std::filesystem::equivalent(job.in, job.out, error)) {
                 printf("bwarp: '%s' would overwrite its own input\n", job.out.string().c_str());
                 return false;
@@ -998,14 +1035,77 @@ namespace {
         return true;
     }
 
-    bool writeOutput(const FileJob& job, const uint8_t* data, size_t size) {
+    // Each file's text in pieces of blockBytes, the last one shorter; an empty file as one empty block.
+    void splitBlocks(std::vector<FileJob>& jobs, int64_t blockBytes, std::vector<Block>& blocks) {
+        for (size_t j = 0; j < jobs.size(); j++) {
+            FileJob& job = jobs[j];
+            Block block;
+
+            job.text = job.size;
+            block.job = j;
+
+            do {
+                block.size = block.n = std::min(blockBytes, job.size - block.offset);
+                block.last = block.offset + block.size == job.size;
+                blocks.push_back(block);
+                block.offset += block.size;
+                block.index++;
+            } while (block.offset < job.size);
+        }
+    }
+
+    // Each file's blocks, from their headers and the sizes that end their indexes (see docs/format.md): false
+    // unless they cover the file exactly.
+    bool scanBlocks(std::vector<FileJob>& jobs, std::vector<Block>& blocks) {
+        for (size_t j = 0; j < jobs.size(); j++) {
+            FileJob& job = jobs[j];
+            const std::string path = job.in.string();
+            Block block;
+
+            block.job = j;
+
+            do {
+                const uint64_t left = static_cast<uint64_t>(job.size - block.offset);
+                uint8_t header[bwarp::kHeaderBytes], end[8];
+                bwarp::BlockHeader parsed;
+                bool ok = left >= sizeof header &&
+                          readFileInto(path.c_str(), header, sizeof header, static_cast<uint64_t>(block.offset)) &&
+                          bwarp::readBlockHeader(header, parsed);
+                const uint64_t indexBytes = ok ? parsed.layout.indexBytes() : 0;
+
+                ok = ok && left >= indexBytes &&
+                     readFileInto(path.c_str(), end, sizeof end, static_cast<uint64_t>(block.offset) + indexBytes - 8);
+
+                const uint64_t size = ok ? bwarp::get64(end) : 0;
+
+                if (!ok || size < indexBytes || size > left) {
+                    printf(block.index == 0 ? "bwarp: '%s' is not a bwarp file\n"
+                                            : "bwarp: '%s' is corrupt: block %d doesn't fit\n",
+                        path.c_str(), block.index);
+                    return false;
+                }
+
+                block.size = static_cast<int64_t>(size);
+                block.n = parsed.layout.n;
+                block.last = size == left;
+                job.text += block.n;
+                blocks.push_back(block);
+                block.offset += block.size;
+                block.index++;
+            } while (block.offset < job.size);
+        }
+
+        return true;
+    }
+
+    bool writeBlock(const FileJob& job, bool first, const uint8_t* data, size_t size) {
         std::error_code error;
 
-        if (job.out.has_parent_path()) {
+        if (first && job.out.has_parent_path()) {
             std::filesystem::create_directories(job.out.parent_path(), error);
         }
 
-        if (!writeFileDirect(job.out.string().c_str(), data, size)) {
+        if (!writeFileDirect(job.out.string().c_str(), data, size, !first)) {
             printf("bwarp: cannot write '%s'\n", job.out.string().c_str());
             return false;
         }
@@ -1018,66 +1118,150 @@ namespace {
         int64_t out = 0;
         double readWait = 0.0;  // waiting for the reader
         double gpu = 0.0;       // the (de)compression calls, host to host
-        double write = 0.0;     // writing, or waiting for the writer
+        double write = 0.0;     // waiting for the writer
     };
 
-    // Reads job i into buffers[i % 2] on another thread while process(i) runs on the one before. process(i) is
-    // only called for jobs read in full; it returns false to stop.
-    template <class Process>
-    bool pipelineJobs(const std::vector<FileJob>& jobs, PinnedBuffer* buffers, CodingTotals& totals, Process process) {
-        const auto read = [&](size_t i) {
-            return readFileInto(jobs[i].in.string().c_str(), buffers[i % 2].data(), static_cast<size_t>(jobs[i].size));
-        };
-        std::future<bool> pending = std::async(std::launch::async, read, size_t(0));
-        bool ok = true;
+    // Writes one block at a time on another thread while the next one is made: its data must stay put until the
+    // next call, or wait().
+    class BlockWriter {
+     public:
+        BlockWriter(std::vector<FileJob>& jobs, CodingTotals& totals) : m_jobs(jobs), m_totals(totals) {}
 
-        for (size_t i = 0; i < jobs.size(); i++) {
+        // False if the block before failed.
+        bool write(const Block& block, const uint8_t* data, size_t size) {
+            if (!wait()) {
+                return false;
+            }
+
+            FileJob& job = m_jobs[block.job];
+
+            job.started = true;
+            job.outBytes += static_cast<int64_t>(size);
+            m_job = block.job;
+            m_pending = std::async(std::launch::async,
+                [&job, first = block.index == 0, data, size] { return writeBlock(job, first, data, size); });
+
+            return true;
+        }
+
+        bool wait() {
+            if (!m_pending.valid()) {
+                return true;
+            }
+
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = m_pending.get();
+
+            m_totals.write += secondsSince(start);
+
+            if (!ok) {
+                m_jobs[m_job].failed = true;
+            }
+
+            return ok;
+        }
+
+     private:
+        std::vector<FileJob>& m_jobs;
+        CodingTotals& m_totals;
+        std::future<bool> m_pending;
+        size_t m_job = 0;
+    };
+
+    // Reads block i into buffers[i % 2] on another thread.
+    std::future<bool> startRead(const std::vector<FileJob>& jobs, const std::vector<Block>& blocks,
+        PinnedBuffer* buffers, size_t i) {
+        return std::async(std::launch::async, [&jobs, &blocks, buffers, i] {
+            const Block& block = blocks[i];
+
+            return readFileInto(jobs[block.job].in.string().c_str(), buffers[i % 2].data(),
+                static_cast<size_t>(block.size), static_cast<uint64_t>(block.offset));
+        });
+    }
+
+    // Reads block i + 1 while process(i) runs, from pending, block 0's read, which the caller started. Stops at
+    // the first failure, marking that block's file as failed.
+    template <class Process>
+    bool pipelineBlocks(std::vector<FileJob>& jobs, const std::vector<Block>& blocks, PinnedBuffer* buffers,
+        CodingTotals& totals, std::future<bool> pending, Process process) {
+
+        for (size_t i = 0; i < blocks.size(); i++) {
             const auto start = std::chrono::steady_clock::now();
             const bool readOk = pending.get();
 
             totals.readWait += secondsSince(start);
 
-            if (i + 1 < jobs.size()) {
-                pending = std::async(std::launch::async, read, i + 1);
+            if (i + 1 < blocks.size()) {
+                pending = startRead(jobs, blocks, buffers, i + 1);
             }
+
+            FileJob& job = jobs[blocks[i].job];
 
             if (!readOk) {
-                printf("bwarp: cannot read '%s'\n", jobs[i].in.string().c_str());
-                ok = false;
-                continue;
+                printf("bwarp: cannot read '%s'\n", job.in.string().c_str());
             }
 
-            if (!process(i)) {
+            if (!readOk || !process(i)) {
+                job.failed = true;
                 return false;  // the pending read finishes in the future's destructor
             }
         }
 
-        return ok;
+        return true;
     }
 
-    // Bits per byte of the text, and its megabytes per second.
+    // Outputs of failed files that were written to are incomplete: removed.
+    void removeFailed(const std::vector<FileJob>& jobs) {
+        for (const FileJob& job : jobs) {
+            std::error_code error;
+
+            if (job.failed && job.started && std::filesystem::remove(job.out, error)) {
+                printf("bwarp: removed the incomplete '%s'\n", job.out.string().c_str());
+            }
+        }
+    }
+
+    double nanosecondsPerByte(int64_t bytes, double seconds) {
+        return bytes > 0 ? 1e9 * seconds / static_cast<double>(bytes) : 0.0;
+    }
+
+    void printCodingHeader(int nameWidth, const char* outName) {
+        printf("%-*s %12s %12s %6s %8s %8s %7s\n", nameWidth, "file", "bytes", outName, "bpc", "GPU ms", "MB/s",
+            "ns/B");
+    }
+
+    // Bits per byte of the text, its megabytes per second and nanoseconds per byte.
     void printCodingRow(const char* name, int nameWidth, int64_t in, int64_t out, int64_t compressed, int64_t text,
         double seconds) {
-        printf("%-*s %12lld %12lld %6.3f %8.2f %8.1f\n", nameWidth, name, static_cast<long long>(in),
+        printf("%-*s %12lld %12lld %6.3f %8.2f %8.1f %7.3f\n", nameWidth, name, static_cast<long long>(in),
             static_cast<long long>(out), text > 0 ? 8.0 * compressed / text : 0.0, 1e3 * seconds,
-            megabytesPerSecond(text, seconds));
+            megabytesPerSecond(text, seconds), nanosecondsPerByte(text, seconds));
     }
 
-    // Prints the totals and the phases: setup before the first file, then the wall time over all files.
+    // Prints the totals and the phases: the time over all files counts the setup before the first, as a whole
+    // run's time does (the Large Text Compression Benchmark's ns/byte).
     void printCodingTotals(const char* verb, int nameWidth, size_t files, const CodingTotals& t, int64_t text,
         double setup, double wall) {
         if (files > 1) {
             printCodingRow("total", nameWidth, t.in, t.out, t.in + t.out - text, text, t.gpu);
         }
 
-        printf("%s %zu file%s in %.1f ms (%.1f MB/s with reading and writing; setup %.1f ms before): GPU %.1f ms, "
-               "waiting to read %.1f ms, to write %.1f ms\n",
-            verb, files, files == 1 ? "" : "s", 1e3 * wall, megabytesPerSecond(text, wall), 1e3 * setup, 1e3 * t.gpu,
-            1e3 * t.readWait, 1e3 * t.write);
+        const double all = setup + wall;
+
+        printf("%s %zu file%s in %.1f ms, %.2f ns/byte (%.1f MB/s) with setup, reading and writing: setup %.1f ms, "
+               "GPU %.1f ms, waiting to read %.1f ms, to write %.1f ms\n",
+            verb, files, files == 1 ? "" : "s", 1e3 * all, nanosecondsPerByte(text, all), megabytesPerSecond(text, all),
+            1e3 * setup, 1e3 * t.gpu, 1e3 * t.readWait, 1e3 * t.write);
+    }
+
+    // "'file'" or "'file', block k" for files of several blocks.
+    std::string blockName(const FileJob& job, const Block& block) {
+        return "'" + job.in.string() + "'" + (block.index > 0 || !block.last ? ", block " + std::to_string(block.index) : "");
     }
 
     int cmdCompress(const Options& options) {
         std::vector<FileJob> jobs;
+        std::vector<Block> blocks;
         int nameWidth;
         const EncodeParams& params = options.encode;
 
@@ -1085,14 +1269,24 @@ namespace {
             return kExitError;
         }
 
-        // One context and two input buffers for the largest file, made before the first is read.
-        auto start = std::chrono::steady_clock::now();
-        int64_t largest = 0;
+        splitBlocks(jobs, options.blockBytes, blocks);
 
-        for (const FileJob& job : jobs) {
-            largest = std::max(largest, job.size);
+        // Two input buffers and one context for the largest block, the first block read meanwhile.
+        auto start = std::chrono::steady_clock::now();
+        int64_t largest = 1;
+
+        for (const Block& block : blocks) {
+            largest = std::max(largest, block.size);
         }
 
+        PinnedBuffer buffers[2];
+
+        if (!buffers[0].allocate(static_cast<size_t>(largest))) {
+            printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largest));
+            return kExitError;
+        }
+
+        std::future<bool> first = startRead(jobs, blocks, buffers, 0);
         GpuBwtContext* created = nullptr;
 
         if (!reportGpu(gpuCreateBwtContext(static_cast<int32_t>(largest), created))) {
@@ -1100,181 +1294,194 @@ namespace {
         }
 
         const std::unique_ptr<GpuBwtContext, void (*)(GpuBwtContext*)> context(created, gpuDestroyBwtContext);
-        PinnedBuffer buffers[2];
 
-        for (size_t b = 0; b < std::min<size_t>(2, jobs.size()); b++) {
-            if (!buffers[b].allocate(static_cast<size_t>(largest))) {
-                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largest));
-                return kExitError;
-            }
+        if (blocks.size() > 1 && !buffers[1].allocate(static_cast<size_t>(largest))) {
+            printf("bwarp: cannot allocate %lld bytes of page-locked memory\n", static_cast<long long>(largest));
+            return kExitError;
         }
 
         const double setup = secondsSince(start);
 
-        printf("%s: %zu file%s, segments 2^%d, slices 2^%d, %d contexts, samples %s\n", options.paths[0], jobs.size(),
-            jobs.size() == 1 ? "" : "s", params.logSegment, params.logSlice, params.contexts,
-            params.logSample != 0 ? ("2^" + std::to_string(params.logSample)).c_str() : "auto");
-        printf("%-*s %12s %12s %6s %8s %8s\n", nameWidth, "file", "bytes", "compressed", "bpc", "GPU ms", "MB/s");
+        if (!options.quiet) {
+            printf("%s: %zu file%s, %zu block%s, segments 2^%d, slices 2^%d, %d contexts, samples %s\n",
+                options.paths[0], jobs.size(), jobs.size() == 1 ? "" : "s", blocks.size(), blocks.size() == 1 ? "" : "s",
+                params.logSegment, params.logSlice, params.contexts,
+                params.logSample != 0 ? ("2^" + std::to_string(params.logSample)).c_str() : "auto");
+            printCodingHeader(nameWidth, "compressed");
+        }
 
         CodingTotals totals;
+        BlockWriter writer(jobs, totals);
 
         start = std::chrono::steady_clock::now();
 
-        const bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
-            const FileJob& job = jobs[i];
-            const int32_t n = static_cast<int32_t>(job.size);
+        // gpuCompress() alternates between two output buffers, so the writer has block i's while i + 1 is made.
+        bool ok = pipelineBlocks(jobs, blocks, buffers, totals, std::move(first), [&](size_t i) {
+            const Block& block = blocks[i];
+            FileJob& job = jobs[block.job];
             const uint8_t* compressed = nullptr;
             size_t size = 0;
             GpuCompressStats stats;
-            auto phase = std::chrono::steady_clock::now();
-            const GpuStatus status =
-                gpuCompress(context.get(), buffers[i % 2].data(), n, params, compressed, size, nullptr, &stats);
+            const auto phase = std::chrono::steady_clock::now();
+            const GpuStatus status = gpuCompress(context.get(), buffers[i % 2].data(), static_cast<int32_t>(block.size),
+                params, compressed, size, nullptr, &stats);
             const double seconds = secondsSince(phase);
 
-            if (!reportGpu(status)) {
-                return false;
+            if (status != GpuStatus::Ok) {
+                return reportGpu(status, blockName(job, block) + ": ");
             }
 
             totals.gpu += seconds;
-            phase = std::chrono::steady_clock::now();
+            job.seconds += seconds;
 
-            if (!writeOutput(job, compressed, size)) {
+            if (!writer.write(block, compressed, size)) {
                 return false;
             }
 
-            totals.write += secondsSince(phase);
-            totals.in += job.size;
+            totals.in += block.size;
             totals.out += static_cast<int64_t>(size);
-            printCodingRow(job.name.c_str(), nameWidth, job.size, static_cast<int64_t>(size), static_cast<int64_t>(size),
-                job.size, seconds);
 
             if (options.verbose) {
                 const GpuBwtStats& b = stats.bwt;
                 const GpuEncodeStats& g = stats.encode;
 
-                printf("  upload %.2f ms, BWT %.2f ms, handover %.2f ms, encoding %.2f ms, download %.2f ms\n",
+                printf("  %supload %.2f ms, BWT %.2f ms, handover %.2f ms, encoding %.2f ms, download %.2f ms\n",
+                    block.index > 0 || !block.last ? ("block " + std::to_string(block.index) + ": ").c_str() : "",
                     1e3 * b.uploadSeconds, 1e3 * b.deviceSeconds, 1e3 * g.uploadSeconds,
                     1e3 * (g.setupSeconds + g.chooseSeconds + g.tableSeconds + g.streamSeconds + g.placeSeconds),
                     1e3 * g.downloadSeconds);
             }
 
+            if (block.last && !options.quiet) {
+                printCodingRow(job.name.c_str(), nameWidth, job.size, job.outBytes, job.outBytes, job.size, job.seconds);
+            }
+
             return true;
         });
 
-        printCodingTotals("compressed", nameWidth, jobs.size(), totals, totals.in, setup, secondsSince(start));
+        ok = writer.wait() && ok;
+        removeFailed(jobs);
+
+        if (!options.quiet) {
+            printCodingTotals("compressed", nameWidth, jobs.size(), totals, totals.in, setup, secondsSince(start));
+        }
 
         return ok ? kExitOk : kExitError;
     }
 
     int cmdDecompress(const Options& options) {
         std::vector<FileJob> jobs;
+        std::vector<Block> blocks;
         int nameWidth;
 
         if (!planJobs(options, false, jobs, nameWidth)) {
             return kExitError;
         }
 
-        // Each header gives its text's size, so that the buffers are made before the first file is read.
+        // The blocks' sizes, from their headers, so that the buffers are made before the first is read.
         auto start = std::chrono::steady_clock::now();
-        int64_t largestIn = 0, largestText = 0;
 
-        for (FileJob& job : jobs) {
-            uint8_t header[bwarp::kHeaderBytes];
-
-            if (job.size < bwarp::kHeaderBytes || !readFileInto(job.in.string().c_str(), header, sizeof header) ||
-                bwarp::get32(header) != bwarp::kMagic) {
-                printf("bwarp: '%s' is not a bwarp file\n", job.in.string().c_str());
-                return kExitError;
-            }
-
-            job.n = bwarp::get32(header + 12);
-            largestIn = std::max(largestIn, job.size);
-            largestText = std::max(largestText, job.n);
+        if (!scanBlocks(jobs, blocks)) {
+            return kExitError;
         }
 
-        // Two of each: file i is read while i - 1 is decompressed, which is written while i is decompressed.
-        PinnedBuffer buffers[2], texts[2];
+        int64_t largestIn = 1, largestText = 1;
 
-        for (size_t b = 0; b < std::min<size_t>(2, jobs.size()); b++) {
-            if (!buffers[b].allocate(static_cast<size_t>(largestIn)) ||
+        for (const Block& block : blocks) {
+            largestIn = std::max(largestIn, block.size);
+            largestText = std::max(largestText, block.n);
+        }
+
+        // Two of each: block i is read while i - 1 is decompressed, which is written while i is decompressed. The
+        // first block is read while the rest are made.
+        PinnedBuffer buffers[2], texts[2];
+        const auto failed = [&] {
+            printf("bwarp: cannot allocate %lld bytes of page-locked memory\n",
+                static_cast<long long>(largestIn + largestText));
+            return kExitError;
+        };
+
+        if (!buffers[0].allocate(static_cast<size_t>(largestIn))) {
+            return failed();
+        }
+
+        std::future<bool> first = startRead(jobs, blocks, buffers, 0);
+
+        for (size_t b = 0; b < std::min<size_t>(2, blocks.size()); b++) {
+            if ((b > 0 && !buffers[b].allocate(static_cast<size_t>(largestIn))) ||
                 !texts[b].allocate(static_cast<size_t>(largestText))) {
-                printf("bwarp: cannot allocate %lld bytes of page-locked memory\n",
-                    static_cast<long long>(largestIn + largestText));
-                return kExitError;
+                return failed();
             }
         }
 
         const double setup = secondsSince(start);
 
-        printf("%s: %zu file%s\n", options.paths[0], jobs.size(), jobs.size() == 1 ? "" : "s");
-        printf("%-*s %12s %12s %6s %8s %8s\n", nameWidth, "file", "bytes", "text", "bpc", "GPU ms", "MB/s");
+        if (!options.quiet) {
+            printf("%s: %zu file%s, %zu block%s\n", options.paths[0], jobs.size(), jobs.size() == 1 ? "" : "s",
+                blocks.size(), blocks.size() == 1 ? "" : "s");
+            printCodingHeader(nameWidth, "text");
+        }
 
         CodingTotals totals;
-        int64_t textBytes = 0;
-        std::future<bool> written;  // the file before, from the other text buffer
-        const auto waitForWrite = [&] {
-            if (!written.valid()) {
-                return true;
-            }
-
-            const auto phase = std::chrono::steady_clock::now();
-            const bool writeOk = written.get();
-
-            totals.write += secondsSince(phase);
-
-            return writeOk;
-        };
+        BlockWriter writer(jobs, totals);
 
         start = std::chrono::steady_clock::now();
 
-        bool ok = pipelineJobs(jobs, buffers, totals, [&](size_t i) {
-            const FileJob& job = jobs[i];
-            PinnedBuffer& text = texts[i % 2];  // file i - 2's, written before file i - 1's write started
+        bool ok = pipelineBlocks(jobs, blocks, buffers, totals, std::move(first), [&](size_t i) {
+            const Block& block = blocks[i];
+            FileJob& job = jobs[block.job];
+            PinnedBuffer& text = texts[i % 2];  // block i - 2's, written before block i - 1's write started
             size_t n = 0;
             GpuDecodeStats stats;
             const auto phase = std::chrono::steady_clock::now();
-            const GpuStatus status = gpuDecompress(buffers[i % 2].data(), static_cast<size_t>(job.size), text.data(),
+            const GpuStatus status = gpuDecompress(buffers[i % 2].data(), static_cast<size_t>(block.size), text.data(),
                 text.capacity(), n, &stats);
             const double seconds = secondsSince(phase);
 
             if (status != GpuStatus::Ok) {
-                printf("bwarp: '%s': ", job.in.string().c_str());
-                reportGpu(status);
-                return false;
+                return reportGpu(status, blockName(job, block) + ": ");
             }
 
             totals.gpu += seconds;
+            job.seconds += seconds;
 
-            if (!waitForWrite()) {
+            if (!writer.write(block, text.data(), n)) {
                 return false;
             }
 
-            written = std::async(std::launch::async, [&job, &text, n] { return writeOutput(job, text.data(), n); });
-            totals.in += job.size;
+            totals.in += block.size;
             totals.out += static_cast<int64_t>(n);
-            textBytes += static_cast<int64_t>(n);
-            printCodingRow(job.name.c_str(), nameWidth, job.size, static_cast<int64_t>(n), job.size,
-                static_cast<int64_t>(n), seconds);
 
             if (options.verbose) {
-                printf("  setup %.2f ms, upload %.2f ms, tables %.2f ms, streams %.2f ms, inverse BWT %.2f ms, "
-                       "download %.2f ms\n",
+                printf("  %ssetup %.2f ms, upload %.2f ms, tables %.2f ms, streams %.2f ms, inverse BWT %.2f ms, "
+                       "download %.2f ms, checksum %.2f ms\n",
+                    block.index > 0 || !block.last ? ("block " + std::to_string(block.index) + ": ").c_str() : "",
                     1e3 * stats.setupSeconds, 1e3 * stats.uploadSeconds,
                     1e3 * (stats.tableSeconds + stats.finishSeconds), 1e3 * stats.streamSeconds,
-                    1e3 * (stats.rankSeconds + stats.chainSeconds), 1e3 * stats.downloadSeconds);
+                    1e3 * (stats.rankSeconds + stats.chainSeconds), 1e3 * stats.downloadSeconds,
+                    1e3 * stats.checkSeconds);
+            }
+
+            if (block.last && !options.quiet) {
+                printCodingRow(job.name.c_str(), nameWidth, job.size, job.outBytes, job.size, job.outBytes, job.seconds);
             }
 
             return true;
         });
 
-        ok = waitForWrite() && ok;
-        printCodingTotals("decompressed", nameWidth, jobs.size(), totals, textBytes, setup, secondsSince(start));
+        ok = writer.wait() && ok;
+        removeFailed(jobs);
+
+        if (!options.quiet) {
+            printCodingTotals("decompressed", nameWidth, jobs.size(), totals, totals.out, setup, secondsSince(start));
+        }
 
         return ok ? kExitOk : kExitError;
     }
 }
 
-int main(int argc, char** argv) {
+// The command line as main() gets it: an exit code. The self-test runs commands through it.
+int runCommand(int argc, char** argv) {
     if (argc < 2) {
         printUsage();
         return kExitError;
@@ -1320,10 +1527,14 @@ int main(int argc, char** argv) {
     }
 
     if (strcmp(command, "selftest") == 0) {
-        return runSelfTest(options.verbose) == 0 ? kExitOk : kExitError;
+        return runSelfTest(options.verbose, runCommand) == 0 ? kExitOk : kExitError;
     }
 
     printUsage();
 
     return kExitError;
+}
+
+int main(int argc, char** argv) {
+    return runCommand(argc, argv);
 }

@@ -25,15 +25,26 @@ namespace {
     constexpr size_t kDirectMinimum = size_t(32) << 20;
 
     // The first size bytes of data (a multiple of kDirectAlignment, data aligned to it) past the file cache, into a
-    // new file at path. Unavailable (as on some network shares) if the file can't be opened that way.
+    // new file at path or appended to it. Unavailable (as on some network shares) if the file can't be opened that
+    // way, or appending, if its size isn't a multiple of kDirectAlignment.
     enum class Direct { Done, Unavailable, Failed };
 
-    Direct writeUncached(const char* path, const uint8_t* data, size_t size) {
-        const HANDLE file =
-            CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_NO_BUFFERING, nullptr);
+    Direct writeUncached(const char* path, const uint8_t* data, size_t size, bool append) {
+        const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, append ? OPEN_EXISTING : CREATE_ALWAYS,
+            FILE_FLAG_NO_BUFFERING, nullptr);
 
         if (file == INVALID_HANDLE_VALUE) {
             return Direct::Unavailable;
+        }
+
+        if (append) {
+            LARGE_INTEGER end{};
+
+            if (!GetFileSizeEx(file, &end) || end.QuadPart % kDirectAlignment != 0 ||
+                !SetFilePointerEx(file, end, nullptr, FILE_BEGIN)) {
+                CloseHandle(file);
+                return Direct::Unavailable;
+            }
         }
 
         // In pieces of at most 64 MiB, a multiple of the alignment that WriteFile's DWORD takes.
@@ -84,8 +95,8 @@ bool readWholeFile(const char* path, std::vector<uint8_t>& out, size_t padding) 
     return bytesRead == static_cast<size_t>(size);
 }
 
-bool writeWholeFile(const char* path, const void* data, size_t size) {
-    FILE* fp = fopen(path, "wb");
+bool writeWholeFile(const char* path, const void* data, size_t size, bool append) {
+    FILE* fp = fopen(path, append ? "ab" : "wb");
 
     if (!fp) {
         return false;
@@ -97,13 +108,13 @@ bool writeWholeFile(const char* path, const void* data, size_t size) {
     return bytesWritten == size && closed;
 }
 
-bool writeFileDirect(const char* path, const void* data, size_t size) {
+bool writeFileDirect(const char* path, const void* data, size_t size, bool append) {
 #if defined(_WIN32)
     const auto* bytes = static_cast<const uint8_t*>(data);
     const size_t head = size / kDirectAlignment * kDirectAlignment;
 
     if (size >= kDirectMinimum && reinterpret_cast<uintptr_t>(bytes) % kDirectAlignment == 0) {
-        switch (writeUncached(path, bytes, head)) {
+        switch (writeUncached(path, bytes, head, append)) {
             case Direct::Done: {
                 // The tail, less than a sector, through the cache.
                 if (head == size) {
@@ -129,13 +140,18 @@ bool writeFileDirect(const char* path, const void* data, size_t size) {
     }
 #endif
 
-    return writeWholeFile(path, data, size);
+    return writeWholeFile(path, data, size, append);
 }
 
-bool readFileInto(const char* path, void* buffer, size_t size) {
+bool readFileInto(const char* path, void* buffer, size_t size, uint64_t offset) {
     FILE* fp = fopen(path, "rb");
 
     if (!fp) {
+        return false;
+    }
+
+    if (offset != 0 && _fseeki64(fp, static_cast<int64_t>(offset), SEEK_SET) != 0) {
+        fclose(fp);
         return false;
     }
 
