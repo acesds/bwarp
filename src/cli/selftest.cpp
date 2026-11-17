@@ -347,6 +347,25 @@ namespace {
             return;
         }
 
+        // The whole compression on the device, which records samples every 2^kAutoMinLogSample positions: with
+        // automatic sampling, the CPU encoder picks the same from those recorded here.
+        if (context) {
+            EncodeParams automatic = params;
+            std::vector<uint8_t> expected;
+            const uint8_t* compressed = nullptr;
+            size_t size = 0;
+
+            automatic.logSample = 0;
+            suite.cases++;
+
+            if (!encodeBwt(bwt.bytes.data(), n, bwt.primary, samples.data(), params.logSample, automatic, expected) ||
+                gpuCompress(context, input.data(), n, automatic, compressed, size) != GpuStatus::Ok ||
+                size != expected.size() || !std::equal(compressed, compressed + size, expected.begin())) {
+                suite.reportFailure(name + " GPU compression", "differs from the CPU encoder", -1);
+                return;
+            }
+        }
+
         if (gpuDecompress(encoded.data(), encoded.size(), text) != GpuStatus::Ok) {
             suite.reportFailure(name + " GPU round trip", gpuLastError(), -1);
             return;

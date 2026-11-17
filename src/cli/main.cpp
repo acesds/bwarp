@@ -97,7 +97,8 @@ namespace {
             "2^LOG2 bytes.\n"
             "--gpu also encodes on the GPU and decompresses there, checks both, and prints their\n"
             "speeds without transfers (the faster of two runs), that of the stream decoder and that\n"
-            "of the inverse BWT; --verbose adds the phases.\n");
+            "of the inverse BWT; gcmp is the whole compression on the GPU, BWT and encoder, host to\n"
+            "host. --verbose adds the phases.\n");
     }
 
     bool parseOptions(int argc, char** argv, Options& options) {
@@ -602,6 +603,7 @@ namespace {
         double encodeSeconds = 0.0;
         double decodeSeconds = 0.0;
         double gpuEncodeSeconds = 0.0;  // the encoder's device phases
+        double gpuCompressSeconds = 0.0;  // gpuCompress(), host to host
         double gpuSeconds = 0.0;        // the decompressor's
         double gpuStreamSeconds = 0.0;
         double gpuInverseSeconds = 0.0;
@@ -616,6 +618,7 @@ namespace {
             encodeSeconds += other.encodeSeconds;
             decodeSeconds += other.decodeSeconds;
             gpuEncodeSeconds += other.gpuEncodeSeconds;
+            gpuCompressSeconds += other.gpuCompressSeconds;
             gpuSeconds += other.gpuSeconds;
             gpuStreamSeconds += other.gpuStreamSeconds;
             gpuInverseSeconds += other.gpuInverseSeconds;
@@ -633,8 +636,8 @@ namespace {
             megabytesPerSecond(run.bytes, run.decodeSeconds));
 
         if (gpu) {
-            printf(" %8.1f %8.1f %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuEncodeSeconds),
-                megabytesPerSecond(run.bytes, run.gpuSeconds),
+            printf(" %8.1f %8.1f %8.1f %8.1f %8.1f", megabytesPerSecond(run.bytes, run.gpuEncodeSeconds),
+                megabytesPerSecond(run.bytes, run.gpuCompressSeconds), megabytesPerSecond(run.bytes, run.gpuSeconds),
                 megabytesPerSecond(run.bytes, run.gpuStreamSeconds), megabytesPerSecond(run.bytes, run.gpuInverseSeconds));
         }
 
@@ -663,7 +666,8 @@ namespace {
             params.contexts, sampling.c_str());
         printf("%-*s %12s %12s %6s %8s %6s %6s %8s %8s", nameWidth, "file", "bytes", "compressed", "bpc", "runs/n",
             "tab%", "idx%", "enc MB/s", "dec MB/s");
-        printf(options.gpu ? " %8s %8s %8s %8s\n" : "\n", "genc MB/s", "gdec MB/s", "str MB/s", "inv MB/s");
+        printf(options.gpu ? " %8s %8s %8s %8s %8s\n" : "\n", "genc MB/s", "gcmp MB/s", "gdec MB/s", "str MB/s",
+            "inv MB/s");
 
         RatioRun total;
         size_t passed = 0;
@@ -740,6 +744,62 @@ namespace {
                         static_cast<long long>(stats.deviceBytes >> 20));
                 }
             }
+
+            // The whole compression on the device, host to host, with a context made beforehand. --verbose also
+            // times building the BWT and encoding it as two calls, gpuBwt() and gpuEncode(), for comparison.
+            GpuBwtContext* context = nullptr;
+
+            if (options.gpu && ok && !reportGpu(gpuCreateBwtContext(n, context))) {
+                ok = false;
+            }
+
+            for (int r = 0; options.gpu && ok && r < 2; r++) {
+                const uint8_t* compressed = nullptr;
+                size_t size = 0;
+                GpuCompressStats stats;
+                auto start = std::chrono::steady_clock::now();
+                const GpuStatus status = gpuCompress(context, text.data(), n, params, compressed, size, nullptr, &stats);
+                const double seconds = secondsSince(start);
+
+                if (!reportGpu(status)) {
+                    ok = false;
+                    break;
+                }
+
+                ok = size == encoded.size() && std::equal(compressed, compressed + size, encoded.begin());
+
+                if (r == 0 || seconds < run.gpuCompressSeconds) {
+                    run.gpuCompressSeconds = seconds;
+                }
+
+                if (options.verbose && r == 1) {
+                    std::vector<uint8_t> separateBwt(n), separateEncoded;
+                    int32_t separatePrimary = 0;
+
+                    start = std::chrono::steady_clock::now();
+
+                    if (!reportGpu(gpuBwt(context, text.data(), n, separateBwt.data(), separatePrimary, nullptr,
+                            samples.data(), kAutoMinLogSample)) ||
+                        !reportGpu(gpuEncode(separateBwt.data(), n, separatePrimary, samples.data(), kAutoMinLogSample,
+                            params, separateEncoded))) {
+                        ok = false;
+                        break;
+                    }
+
+                    const double separate = secondsSince(start);
+                    const GpuBwtStats& b = stats.bwt;
+                    const GpuEncodeStats& g = stats.encode;
+
+                    printf("  GPU compressor: %.2f ms (gpuBwt() then gpuEncode(): %.2f ms); BWT upload %.2f ms, "
+                           "construction %.2f ms; encoder setup %.2f ms, handover %.2f ms, choosing %.2f ms, tables "
+                           "%.2f ms, streams %.2f ms, placing %.2f ms, download %.2f ms\n",
+                        1e3 * seconds, 1e3 * separate, 1e3 * b.uploadSeconds, 1e3 * b.deviceSeconds,
+                        1e3 * g.setupSeconds, 1e3 * g.uploadSeconds, 1e3 * g.chooseSeconds, 1e3 * g.tableSeconds,
+                        1e3 * g.streamSeconds, 1e3 * g.placeSeconds, 1e3 * g.downloadSeconds);
+                }
+            }
+
+            gpuDestroyBwtContext(context);
 
             for (int r = 0; options.gpu && ok && r < 2; r++) {
                 GpuDecodeStats stats;

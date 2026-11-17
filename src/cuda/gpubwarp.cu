@@ -346,6 +346,8 @@ struct GpuBwtContext {
     cudaMemPool_t pool = nullptr;
     int32_t capacity = 0;
     Staging staging;
+    uint8_t* output = nullptr;  // gpuCompress()'s, page-locked
+    size_t outputCapacity = 0;
 
     GpuBwtContext() = default;
     GpuBwtContext(const GpuBwtContext&) = delete;
@@ -356,6 +358,10 @@ struct GpuBwtContext {
 
         if (pool) {
             cudaMemPoolDestroy(pool);
+        }
+
+        if (output) {
+            cudaFreeHost(output);
         }
     }
 };
@@ -924,6 +930,185 @@ GpuStatus gpuDecompress(const uint8_t* data, size_t size, std::vector<uint8_t>& 
 
 // ---- Encoding ----------------------------------------------------------------------------------
 
+namespace {
+    // Device memory a pool for encodeOnDevice() reserves ahead: the BWT, the per-segment and per-slice arrays, and
+    // typically enough for the ops and the body, sized on the way.
+    size_t encodeReserve(const bwarp::Layout& coding) {
+        const size_t perSegment =
+            bwarp::gpu::kReservedOps * 6 + sizeof(bwarp::TableData) + sizeof(bwarp::gpu::DeviceTable) + 64;
+        const size_t perSlice = (size_t(1) << coding.logSlice) + bwarp::kLanes * 4 + 32;
+
+        return size_t(coding.n) * 2 + 16 + coding.segments * perSegment + coding.slices * perSlice + (size_t(1) << 20);
+    }
+
+    // encodeBwt() of a valid input with n > 0 whose BWT is on the device, padded to 16 bytes: leaves the tables and
+    // streams in body, bodyBytes of them, and writes the header, samples and offsets to index. Everything comes
+    // from pool. prepare(bodyBytes) runs while the device places the body, which is done on return.
+    template <class Prepare>
+    GpuStatus encodeOnDevice(const uint8_t* deviceBwt, int32_t n, int32_t primary, const uint32_t* samples,
+        int recordedLogSample, const EncodeParams& params, cudaMemPool_t pool, DeviceArray<uint8_t>& body,
+        uint64_t& bodyBytes, std::vector<uint8_t>& index, EncodeStats& e, GpuEncodeStats& s, Prepare prepare) {
+        using namespace bwarp;
+
+        const Layout coding(static_cast<uint32_t>(n), params.logSegment, params.logSlice, kMaxLogSample);
+        std::vector<uint64_t> segmentOffsets(coding.segments + 1, 0), sliceOffsets(coding.slices + 1, 0);
+        cudaError_t error;
+        auto start = std::chrono::steady_clock::now();
+        DeviceArray<uint32_t> cost, ops, wordCounts, states, sliceWords, sliceStates;
+        DeviceArray<uint16_t> words, scratch;
+        const uint32_t scratchWords = 1u << (coding.logSlice - 1);  // per slice: as many bytes as it codes, at most
+        DeviceArray<uint64_t> decisions, opOffsets, deviceSegmentOffsets, deviceSliceOffsets;
+        DeviceArray<unsigned long long> tokens;
+        DeviceArray<TableData> tables;
+        DeviceArray<gpu::DeviceTable> codes;
+        DeviceArray<uint8_t> temp;
+        size_t scanBytes = 0;
+
+        if ((error = cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, decisions.get(), opOffsets.get(),
+                 coding.segments + 1)) != cudaSuccess ||
+            (error = cost.allocate(kProbScale + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = decisions.allocate(coding.segments + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = opOffsets.allocate(coding.segments + 1, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = temp.allocate(scanBytes, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = tables.allocate(coding.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = codes.allocate(coding.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = wordCounts.allocate(coding.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = states.allocate(coding.segments, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = sliceWords.allocate(coding.slices, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = sliceStates.allocate(size_t(coding.slices) * kLanes, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = scratch.allocate(size_t(coding.slices) * scratchWords, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = tokens.allocate(1, s.deviceBytes, pool)) != cudaSuccess) {
+            return failed("cudaMalloc", error);
+        }
+
+        s.setupSeconds += secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        if ((error = cudaMemcpyAsync(cost.get(), encodingCosts(), cost.bytes(), cudaMemcpyHostToDevice)) !=
+                cudaSuccess ||
+            (error = cudaMemsetAsync(decisions.get(), 0, decisions.bytes())) != cudaSuccess ||
+            (error = cudaMemsetAsync(tokens.get(), 0, tokens.bytes())) != cudaSuccess ||
+            (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("upload", error);
+        }
+
+        s.uploadSeconds += secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        // Up to 2^16 bytes per segment, the counts pack into 16 bits.
+        (coding.logSegment <= 16 ? gpu::chooseTables<true> : gpu::chooseTables<false>)<<<coding.segments,
+            gpu::kChooseThreads>>>(deviceBwt, coding.n, coding.logSegment, coding.logSlice,
+            static_cast<uint32_t>(params.contexts), cost.get(), tables.get(), decisions.get());
+
+        uint64_t totalOps = 0;
+
+        if ((error = cudaGetLastError()) != cudaSuccess ||
+            (error = cub::DeviceScan::ExclusiveSum(temp.get(), scanBytes, decisions.get(), opOffsets.get(),
+                 coding.segments + 1)) != cudaSuccess ||
+            (error = cudaMemcpy(&totalOps, opOffsets.get() + coding.segments, sizeof totalOps,
+                 cudaMemcpyDeviceToHost)) != cudaSuccess) {
+            return failed("choosing tables", error);
+        }
+
+        s.chooseSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        if ((error = ops.allocate(totalOps, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = words.allocate(totalOps, s.deviceBytes, pool)) != cudaSuccess) {
+            return failed("cudaMalloc", error);
+        }
+
+        gpu::encodeTables<<<(coding.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(
+            tables.get(), coding.segments, opOffsets.get(), ops.get(), words.get(), wordCounts.get(), states.get());
+        gpu::finishTables<<<coding.segments, 256>>>(tables.get(), codes.get(), false);
+
+        if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("coding tables", error);
+        }
+
+        s.tableSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        const uint32_t sliceBlocks = (coding.slices + gpu::kEncodeWarps - 1) / gpu::kEncodeWarps;
+        std::vector<uint32_t> tableWords(coding.segments), streamWords(coding.slices);
+        unsigned long long tokenCount = 0;
+        gpu::SliceOutput to{sliceWords.get(), scratch.get(), scratchWords, sliceStates.get(), tokens.get(), nullptr,
+            nullptr};
+
+        gpu::encodeSlices<false><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt, coding.n, coding.slices,
+            coding.logSegment, coding.logSlice, tables.get(), codes.get(), to);
+
+        if ((error = cudaGetLastError()) != cudaSuccess ||
+            (error = cudaMemcpy(tableWords.data(), wordCounts.get(), tableWords.size() * 4, cudaMemcpyDeviceToHost)) !=
+                cudaSuccess ||
+            (error = cudaMemcpy(streamWords.data(), sliceWords.get(), streamWords.size() * 4,
+                 cudaMemcpyDeviceToHost)) != cudaSuccess ||
+            (error = cudaMemcpy(&tokenCount, tokens.get(), sizeof tokenCount, cudaMemcpyDeviceToHost)) !=
+                cudaSuccess) {
+            return failed("encoding streams", error);
+        }
+
+        s.streamSeconds = secondsSince(start);
+        start = std::chrono::steady_clock::now();
+
+        for (uint32_t g = 0; g < coding.segments; g++) {
+            segmentOffsets[g + 1] = segmentOffsets[g] + 4 + 2 * uint64_t(tableWords[g]);
+        }
+
+        sliceOffsets[0] = segmentOffsets[coding.segments];
+
+        for (uint32_t sl = 0; sl < coding.slices; sl++) {
+            sliceOffsets[sl + 1] = sliceOffsets[sl] + kLanes * 4 + 2 * uint64_t(streamWords[sl]);
+        }
+
+        // The device writes the body, the tables and streams, while the host writes the index and prepares.
+        bodyBytes = sliceOffsets.back();
+
+        if ((error = body.allocate(bodyBytes, s.deviceBytes, pool)) != cudaSuccess ||
+            (error = deviceSegmentOffsets.allocate(segmentOffsets.size(), s.deviceBytes, pool)) != cudaSuccess ||
+            (error = deviceSliceOffsets.allocate(sliceOffsets.size(), s.deviceBytes, pool)) != cudaSuccess ||
+            (error = cudaMemcpyAsync(deviceSegmentOffsets.get(), segmentOffsets.data(), deviceSegmentOffsets.bytes(),
+                 cudaMemcpyHostToDevice)) != cudaSuccess ||
+            (error = cudaMemcpyAsync(deviceSliceOffsets.get(), sliceOffsets.data(), deviceSliceOffsets.bytes(),
+                 cudaMemcpyHostToDevice)) != cudaSuccess) {
+            return failed("placing", error);
+        }
+
+        // If a stream outgrew its scratch (incompressible data), all are encoded again, in place.
+        to.offsets = deviceSliceOffsets.get();
+        to.out = body.get();
+        gpu::placeTables<<<coding.segments, 256>>>(words.get(), opOffsets.get(), wordCounts.get(), states.get(),
+            deviceSegmentOffsets.get(), body.get());
+
+        if (*std::max_element(streamWords.begin(), streamWords.end()) <= scratchWords) {
+            gpu::placeSlices<<<coding.slices, 256>>>(to);
+        } else {
+            gpu::encodeSlices<true><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt, coding.n, coding.slices,
+                coding.logSegment, coding.logSlice, tables.get(), codes.get(), to);
+        }
+
+        writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, index, e);
+        e.tokens = static_cast<int64_t>(tokenCount);
+
+        if ((error = cudaGetLastError()) != cudaSuccess) {
+            return failed("placing", error);
+        }
+
+        if (const GpuStatus status = prepare(bodyBytes); status != GpuStatus::Ok) {
+            cudaDeviceSynchronize();  // before the arrays go
+            return status;
+        }
+
+        if ((error = cudaDeviceSynchronize()) != cudaSuccess) {
+            return failed("placing", error);
+        }
+
+        s.placeSeconds = secondsSince(start);
+
+        return GpuStatus::Ok;
+    }
+}
+
 GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
     const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats, GpuEncodeStats* stats) {
     using namespace bwarp;
@@ -937,178 +1122,219 @@ GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32
 
     s = GpuEncodeStats{};
     e = EncodeStats{};
+    out.clear();
 
     if (!validEncodeInput(n, primary, samples, recordedLogSample, params)) {
         snprintf(lastError, sizeof lastError, "invalid encoding parameters or rows");
         return GpuStatus::Invalid;
     }
 
-    const Layout coding(static_cast<uint32_t>(n), params.logSegment, params.logSlice, kMaxLogSample);
-    std::vector<uint64_t> segmentOffsets(coding.segments + 1, 0), sliceOffsets(coding.slices + 1, 0);
-
     if (n == 0) {
+        const Layout coding(0, params.logSegment, params.logSlice, kMaxLogSample);
+        const std::vector<uint64_t> segmentOffsets(coding.segments + 1, 0), sliceOffsets(coding.slices + 1, 0);
+
         writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
         return GpuStatus::Ok;
     }
 
     cudaError_t error;
     auto start = std::chrono::steady_clock::now();
-    DevicePool pool;  // for what is sized on the way, reserved ahead: the ops, then the body's size
-    DeviceArray<uint8_t> deviceBwt, deviceOut;
-    DeviceArray<uint32_t> cost, ops, wordCounts, states, sliceWords, sliceStates;
-    DeviceArray<uint16_t> words, scratch;
-    const uint32_t scratchWords = 1u << (coding.logSlice - 1);  // per slice: as many bytes as it codes, at most
-    DeviceArray<uint64_t> decisions, opOffsets, deviceSegmentOffsets, deviceSliceOffsets;
-    DeviceArray<unsigned long long> tokens;
-    DeviceArray<TableData> tables;
-    DeviceArray<gpu::DeviceTable> codes;
-    DeviceArray<uint8_t> temp;
-    size_t scanBytes = 0;
+    DevicePool pool;  // declared first: it outlives the arrays
+    DeviceArray<uint8_t> deviceBwt, body;
+    uint64_t bodyBytes = 0;
 
-    if ((error = cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, decisions.get(), opOffsets.get(),
-             coding.segments + 1)) != cudaSuccess ||
-        (error = pool.create(size_t(coding.segments) * gpu::kReservedOps * 6 + size_t(n) + (1u << 20))) !=
+    if ((error = pool.create(encodeReserve(Layout(uint32_t(n), params.logSegment, params.logSlice, kMaxLogSample)))) !=
             cudaSuccess ||
-        (error = deviceBwt.allocate(size_t(n) + 16, s.deviceBytes)) != cudaSuccess ||
-        (error = cost.allocate(kProbScale + 1, s.deviceBytes)) != cudaSuccess ||
-        (error = decisions.allocate(coding.segments + 1, s.deviceBytes)) != cudaSuccess ||
-        (error = opOffsets.allocate(coding.segments + 1, s.deviceBytes)) != cudaSuccess ||
-        (error = temp.allocate(scanBytes, s.deviceBytes)) != cudaSuccess ||
-        (error = tables.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = codes.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = wordCounts.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = states.allocate(coding.segments, s.deviceBytes)) != cudaSuccess ||
-        (error = sliceWords.allocate(coding.slices, s.deviceBytes)) != cudaSuccess ||
-        (error = sliceStates.allocate(size_t(coding.slices) * kLanes, s.deviceBytes)) != cudaSuccess ||
-        (error = scratch.allocate(size_t(coding.slices) * scratchWords, s.deviceBytes)) != cudaSuccess ||
-        (error = tokens.allocate(1, s.deviceBytes)) != cudaSuccess) {
+        (error = deviceBwt.allocate(size_t(n) + 16, s.deviceBytes, pool.get())) != cudaSuccess) {
         return failed("cudaMalloc", error);
     }
 
     s.setupSeconds = secondsSince(start);
     start = std::chrono::steady_clock::now();
 
-    if ((error = cudaMemcpy(deviceBwt.get(), bwt, size_t(n), cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemcpy(cost.get(), encodingCosts(), cost.bytes(), cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemset(decisions.get(), 0, decisions.bytes())) != cudaSuccess ||
-        (error = cudaMemset(tokens.get(), 0, tokens.bytes())) != cudaSuccess ||
-        (error = cudaDeviceSynchronize()) != cudaSuccess) {
+    if ((error = cudaMemcpy(deviceBwt.get(), bwt, size_t(n), cudaMemcpyHostToDevice)) != cudaSuccess) {
         return failed("upload", error);
     }
 
     s.uploadSeconds = secondsSince(start);
+
+    // While the device places the body, the host makes room for it.
+    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, samples, recordedLogSample, params,
+        pool.get(), body, bodyBytes, out, e, s, [&](uint64_t bytes) {
+            out.resize(out.size() + bytes);
+            return GpuStatus::Ok;
+        });
+
+    if (status != GpuStatus::Ok) {
+        return status;
+    }
+
     start = std::chrono::steady_clock::now();
 
-    // Up to 2^16 bytes per segment, the counts pack into 16 bits.
-    (coding.logSegment <= 16 ? gpu::chooseTables<true> : gpu::chooseTables<false>)<<<coding.segments,
-        gpu::kChooseThreads>>>(deviceBwt.get(), coding.n, coding.logSegment, coding.logSlice,
-        static_cast<uint32_t>(params.contexts), cost.get(), tables.get(), decisions.get());
-
-    uint64_t totalOps = 0;
-
-    if ((error = cudaGetLastError()) != cudaSuccess ||
-        (error = cub::DeviceScan::ExclusiveSum(temp.get(), scanBytes, decisions.get(), opOffsets.get(),
-             coding.segments + 1)) != cudaSuccess ||
-        (error = cudaMemcpy(&totalOps, opOffsets.get() + coding.segments, sizeof totalOps, cudaMemcpyDeviceToHost)) !=
-            cudaSuccess) {
-        return failed("choosing tables", error);
-    }
-
-    s.chooseSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    if ((error = ops.allocate(totalOps, s.deviceBytes, pool.get())) != cudaSuccess ||
-        (error = words.allocate(totalOps, s.deviceBytes, pool.get())) != cudaSuccess) {
-        return failed("cudaMalloc", error);
-    }
-
-    gpu::encodeTables<<<(coding.segments + gpu::kTableWarps - 1) / gpu::kTableWarps, gpu::kTableWarps * 32>>>(
-        tables.get(), coding.segments, opOffsets.get(), ops.get(), words.get(), wordCounts.get(), states.get());
-    gpu::finishTables<<<coding.segments, 256>>>(tables.get(), codes.get(), false);
-
-    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
-        return failed("coding tables", error);
-    }
-
-    s.tableSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    const uint32_t sliceBlocks = (coding.slices + gpu::kEncodeWarps - 1) / gpu::kEncodeWarps;
-    std::vector<uint32_t> tableWords(coding.segments), streamWords(coding.slices);
-    unsigned long long tokenCount = 0;
-    gpu::SliceOutput to{sliceWords.get(), scratch.get(), scratchWords, sliceStates.get(), tokens.get(), nullptr, nullptr};
-
-    gpu::encodeSlices<false><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt.get(), coding.n, coding.slices,
-        coding.logSegment, coding.logSlice, tables.get(), codes.get(), to);
-
-    if ((error = cudaGetLastError()) != cudaSuccess ||
-        (error = cudaMemcpy(tableWords.data(), wordCounts.get(), tableWords.size() * 4, cudaMemcpyDeviceToHost)) !=
-            cudaSuccess ||
-        (error = cudaMemcpy(streamWords.data(), sliceWords.get(), streamWords.size() * 4, cudaMemcpyDeviceToHost)) !=
-            cudaSuccess ||
-        (error = cudaMemcpy(&tokenCount, tokens.get(), sizeof tokenCount, cudaMemcpyDeviceToHost)) != cudaSuccess) {
-        return failed("encoding streams", error);
-    }
-
-    s.streamSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    for (uint32_t g = 0; g < coding.segments; g++) {
-        segmentOffsets[g + 1] = segmentOffsets[g] + 4 + 2 * uint64_t(tableWords[g]);
-    }
-
-    sliceOffsets[0] = segmentOffsets[coding.segments];
-
-    for (uint32_t sl = 0; sl < coding.slices; sl++) {
-        sliceOffsets[sl + 1] = sliceOffsets[sl] + kLanes * 4 + 2 * uint64_t(streamWords[sl]);
-    }
-
-    // The device writes the body, the tables and streams, while the host writes the index and makes room for them.
-    const uint64_t bodyBytes = sliceOffsets.back();
-
-    if ((error = deviceOut.allocate(bodyBytes, s.deviceBytes, pool.get())) != cudaSuccess ||
-        (error = deviceSegmentOffsets.allocate(segmentOffsets.size(), s.deviceBytes, pool.get())) != cudaSuccess ||
-        (error = deviceSliceOffsets.allocate(sliceOffsets.size(), s.deviceBytes, pool.get())) != cudaSuccess ||
-        (error = cudaMemcpyAsync(deviceSegmentOffsets.get(), segmentOffsets.data(), deviceSegmentOffsets.bytes(),
-             cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (error = cudaMemcpyAsync(deviceSliceOffsets.get(), sliceOffsets.data(), deviceSliceOffsets.bytes(),
-             cudaMemcpyHostToDevice)) != cudaSuccess) {
-        return failed("placing", error);
-    }
-
-    // If a stream outgrew its scratch (incompressible data), all are encoded again, in place.
-    to.offsets = deviceSliceOffsets.get();
-    to.out = deviceOut.get();
-    gpu::placeTables<<<coding.segments, 256>>>(words.get(), opOffsets.get(), wordCounts.get(), states.get(),
-        deviceSegmentOffsets.get(), deviceOut.get());
-
-    if (*std::max_element(streamWords.begin(), streamWords.end()) <= scratchWords) {
-        gpu::placeSlices<<<coding.slices, 256>>>(to);
-    } else {
-        gpu::encodeSlices<true><<<sliceBlocks, gpu::kEncodeWarps * 32>>>(deviceBwt.get(), coding.n, coding.slices,
-            coding.logSegment, coding.logSlice, tables.get(), codes.get(), to);
-    }
-
-    writeIndex(n, primary, samples, recordedLogSample, params, segmentOffsets, sliceOffsets, out, e);
-    e.tokens = static_cast<int64_t>(tokenCount);
-
-    const size_t indexBytes = out.size();
-
-    out.resize(indexBytes + bodyBytes);
-
-    if ((error = cudaGetLastError()) != cudaSuccess || (error = cudaDeviceSynchronize()) != cudaSuccess) {
-        return failed("placing", error);
-    }
-
-    s.placeSeconds = secondsSince(start);
-    start = std::chrono::steady_clock::now();
-
-    if ((error = cudaMemcpy(out.data() + indexBytes, deviceOut.get(), bodyBytes, cudaMemcpyDeviceToHost)) !=
+    if ((error = cudaMemcpy(out.data() + out.size() - bodyBytes, body.get(), bodyBytes, cudaMemcpyDeviceToHost)) !=
         cudaSuccess) {
         return failed("download", error);
     }
 
     s.downloadSeconds = secondsSince(start);
+
+    return GpuStatus::Ok;
+}
+
+// ---- Compression -------------------------------------------------------------------------------
+
+namespace {
+    // The BWT as gpuBwt() downloads it, padded with zeros to 16 more bytes: byte 0, the sentinel's row, is
+    // T[n - 1], and the merge's byte head, suffix 0's, is left out.
+    __global__ void packBwt(const uint8_t* __restrict__ merged, const uint8_t* __restrict__ text, uint32_t n,
+        uint32_t head, uint8_t* __restrict__ bwt) {
+        for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n + 16; i += gridDim.x * blockDim.x) {
+            bwt[i] = i == 0 ? text[n - 1] : i < head ? merged[i] : i < n ? merged[i + 1] : 0;
+        }
+    }
+
+    // Grows the context's page-locked output buffer to at least bytes, with some room to spare.
+    GpuStatus reserveOutput(GpuBwtContext& context, size_t bytes) {
+        if (bytes <= context.outputCapacity) {
+            return GpuStatus::Ok;
+        }
+
+        gpuFreePinned(context.output);
+        context.outputCapacity = bytes + bytes / 8;
+        context.output = static_cast<uint8_t*>(gpuAllocatePinned(context.outputCapacity));
+
+        if (!context.output) {
+            context.outputCapacity = 0;
+            snprintf(lastError, sizeof lastError, "out of page-locked host memory");
+            return GpuStatus::NotEnoughMemory;
+        }
+
+        return GpuStatus::Ok;
+    }
+}
+
+GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, const EncodeParams& params,
+    const uint8_t*& out, size_t& size, EncodeStats* encodeStats, GpuCompressStats* stats) {
+    using namespace bwarp;
+
+    lastError[0] = '\0';
+
+    GpuCompressStats local;
+    GpuCompressStats& s = stats ? *stats : local;
+    EncodeStats localEncode;
+    EncodeStats& e = encodeStats ? *encodeStats : localEncode;
+
+    s = GpuCompressStats{};
+    e = EncodeStats{};
+    out = nullptr;
+    size = 0;
+
+    if (!context) {
+        snprintf(lastError, sizeof lastError, "gpuCompress() needs a context");
+        return GpuStatus::Invalid;
+    }
+
+    // The parameters, before building anything: as for an empty input, which has no rows to check.
+    if (n < 0 || !validEncodeInput(0, 0, nullptr, kAutoMinLogSample, params)) {
+        snprintf(lastError, sizeof lastError, "invalid encoding parameters");
+        return GpuStatus::Invalid;
+    }
+
+    std::vector<uint32_t> samples(sampleCount(static_cast<uint32_t>(n), kAutoMinLogSample));
+    std::vector<uint8_t> index;
+    int32_t primary = 0;
+
+    // Too small to build on the device: gpuBwt() and gpuEncode().
+    if (n <= 1) {
+        uint8_t bwt = 0;
+        GpuStatus status;
+
+        if ((status = gpuBwt(context, text, n, &bwt, primary, &s.bwt)) != GpuStatus::Ok ||
+            (status = gpuEncode(&bwt, n, primary, samples.data(), kAutoMinLogSample, params, index, &e,
+                 &s.encode)) != GpuStatus::Ok ||
+            (status = reserveOutput(*context, index.size())) != GpuStatus::Ok) {
+            return status;
+        }
+
+        memcpy(context->output, index.data(), index.size());
+        out = context->output;
+        size = index.size();
+
+        return GpuStatus::Ok;
+    }
+
+    DeviceArray<uint8_t> deviceBwt, body;  // from the context's pool, which outlives them
+    cudaError_t error;
+    std::chrono::steady_clock::time_point start;
+
+    // The construction's memory goes back to the pool, in stream order, before the encoder takes from it.
+    {
+        gpusa::Construction c(context->pool);
+        gpusa::Merger merger;
+        uint32_t* lists = nullptr;
+        uint32_t* output = nullptr;
+        uint32_t row = 0;
+
+        if (const GpuStatus status = buildOnDevice(*context, c, text, n, s.bwt, lists, output, merger, row,
+                samples.data(), kAutoMinLogSample);
+            status != GpuStatus::Ok) {
+            return status;
+        }
+
+        start = std::chrono::steady_clock::now();
+
+        if ((error = deviceBwt.allocate(size_t(n) + 16, s.encode.deviceBytes, context->pool)) != cudaSuccess) {
+            return failed("cudaMalloc", error);
+        }
+
+        packBwt<<<std::min<uint32_t>((uint32_t(n) + 16 + 255) / 256, 4096), 256>>>(
+            reinterpret_cast<const uint8_t*>(output), reinterpret_cast<const uint8_t*>(c.text), uint32_t(n), row + 1,
+            deviceBwt.get());
+
+        if ((error = cudaGetLastError()) != cudaSuccess) {
+            return failed("BWT", error);
+        }
+
+        primary = static_cast<int32_t>(row) + 1;
+    }
+
+    s.encode.uploadSeconds = secondsSince(start);
+
+    if (!validEncodeInput(n, primary, samples.data(), kAutoMinLogSample, params)) {
+        snprintf(lastError, sizeof lastError, "the construction's rows are out of range");
+        return GpuStatus::Failed;
+    }
+
+    // While the device places the body, the host copies the index into the output buffer.
+    uint64_t bodyBytes = 0;
+    const GpuStatus status = encodeOnDevice(deviceBwt.get(), n, primary, samples.data(), kAutoMinLogSample, params,
+        context->pool, body, bodyBytes, index, e, s.encode, [&](uint64_t bytes) {
+            const auto growing = std::chrono::steady_clock::now();
+            const GpuStatus reserved = reserveOutput(*context, index.size() + bytes);
+
+            s.encode.setupSeconds += secondsSince(growing);
+
+            if (reserved == GpuStatus::Ok) {
+                memcpy(context->output, index.data(), index.size());
+            }
+
+            return reserved;
+        });
+
+    if (status != GpuStatus::Ok) {
+        return status;
+    }
+
+    start = std::chrono::steady_clock::now();
+
+    if ((error = cudaMemcpy(context->output + index.size(), body.get(), bodyBytes, cudaMemcpyDeviceToHost)) !=
+        cudaSuccess) {
+        return failed("download", error);
+    }
+
+    s.encode.downloadSeconds = secondsSince(start);
+    out = context->output;
+    size = index.size() + bodyBytes;
 
     return GpuStatus::Ok;
 }

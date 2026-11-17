@@ -123,3 +123,16 @@ struct GpuEncodeStats {
 GpuStatus gpuEncode(const uint8_t* bwt, int32_t n, int32_t primary, const uint32_t* samples, int recordedLogSample,
     const EncodeParams& params, std::vector<uint8_t>& out, EncodeStats* encodeStats = nullptr,
     GpuEncodeStats* stats = nullptr);
+
+// ---- Compression -------------------------------------------------------------------------------
+
+struct GpuCompressStats {
+    GpuBwtStats bwt;        // its downloadSeconds stay 0: the BWT stays on the device
+    GpuEncodeStats encode;  // uploadSeconds: handing it over; setupSeconds: also growing the output buffer
+};
+
+// Builds the BWT of text and encodes it, all on the device: the same bytes as gpuBwt() with samples every
+// 2^kAutoMinLogSample positions, then encodeBwt(). out points into the context's page-locked output buffer and
+// stays valid until its next call or its destruction. Invalid where encodeBwt() returns false.
+GpuStatus gpuCompress(GpuBwtContext* context, const uint8_t* text, int32_t n, const EncodeParams& params,
+    const uint8_t*& out, size_t& size, EncodeStats* encodeStats = nullptr, GpuCompressStats* stats = nullptr);

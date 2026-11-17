@@ -79,3 +79,19 @@ GpuStatus gpuEncode(const uint8_t*, int32_t, int32_t, const uint32_t*, int, cons
 
     return GpuStatus::Unavailable;
 }
+
+GpuStatus gpuCompress(GpuBwtContext*, const uint8_t*, int32_t, const EncodeParams&, const uint8_t*& out, size_t& size,
+    EncodeStats* encodeStats, GpuCompressStats* stats) {
+    out = nullptr;
+    size = 0;
+
+    if (encodeStats) {
+        *encodeStats = EncodeStats{};
+    }
+
+    if (stats) {
+        *stats = GpuCompressStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
