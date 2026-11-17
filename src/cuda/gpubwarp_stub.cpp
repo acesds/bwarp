@@ -14,7 +14,11 @@ GpuStatus gpuQueryDevice(GpuDevice&) {
 }
 
 const char* gpuLastError() {
+#ifdef _WIN32
     return "bwarp was built without CUDA (configure with the cuda preset)";
+#else
+    return "bwarp was built without CUDA (configure with the linux-cuda preset)";
+#endif
 }
 
 void* gpuAllocatePinned(size_t) {
