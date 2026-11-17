@@ -67,7 +67,21 @@ The `.bwt` file is in divsufsort's `bwt` format as a single block: n and the pri
 
 ## Build
 
-bwarp builds on Windows x64 only for now. You'll need:
+bwarp builds on Windows x64, and should build on Linux too, though I haven't tried that yet. Either way you'll want an NVIDIA GPU with CUDA 13 or newer to actually compress; without one you get the CPU parts only (the reference codec, the checker and the selftest). The GPU variant targets sm_120 (Blackwell) plus PTX for newer GPUs; pass `-DBWARP_CUDA_ARCHITECTURES=...` to build for others. I've only tested it on sm_120.
+
+### Linux
+
+You'll need CMake 3.23 or newer, Ninja, GCC or Clang with C++20, and for the GPU variant the CUDA toolkit (`nvcc` on the `PATH` or in `CUDACXX`). Then:
+
+```
+./build.sh
+```
+
+This builds the CPU and GPU parts into `build-cuda/bin/Release/` if it finds `nvcc`, otherwise the CPU parts only into `build/bin/Release/`. `./build.sh cpu` always builds the CPU parts only. By hand, that's `cmake --preset linux-cuda` or `cmake --preset linux`, then `cmake --build` on the build directory.
+
+### Windows
+
+You'll need:
 
 - Visual Studio 2022 with the "Desktop development with C++" workload.
 - CMake 3.23 or newer.
@@ -105,7 +119,6 @@ With the ClangCL toolset, the CUDA 13.5 Visual Studio integration fails CMake's 
 - `src/cli/`: the command line and the selftest.
 - `docs/`: the [format](docs/format.md) and the [Large Text Compression Benchmark figures](docs/ltcb.md).
 - `tools/`: `ltcb.ps1`, which measures those figures.
-
 ## License
 
 MIT, see [LICENSE](LICENSE). Builds with the GPU variant include NVIDIA's CUB (BSD-3-Clause); [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) has its notice. `cmake --install` puts both files next to `bwarp.exe`.

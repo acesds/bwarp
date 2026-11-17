@@ -12,6 +12,8 @@ if(MSVC)
 endif()
 
 option(BWARP_CUDA "Build the GPU variant if a CUDA compiler is found" ON)
+set(BWARP_CUDA_ARCHITECTURES "120-real;120-virtual" CACHE STRING
+    "GPU architectures for the GPU variant: sm_120 (Blackwell) and PTX for newer GPUs by default")
 
 # The GPU variant is optional: without a CUDA compiler bwarp builds the CPU parts only, and
 # gpubwarp_stub.cpp reports every GPU call as unavailable. With the ClangCL toolset the CUDA 13.5
@@ -74,7 +76,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE src/common src/codec src/cuda
 source_group(TREE "${CMAKE_SOURCE_DIR}/src" FILES ${BWARP_SOURCES})
 
 # The GPU variant: device code compiled by nvcc, with MSVC's cl.exe as host compiler on
-# Windows. sm_120 (Blackwell) plus PTX for newer GPUs; CUB ships with the toolkit.
+# Windows and GCC on Linux. BWARP_CUDA_ARCHITECTURES picks the GPUs; CUB ships with the toolkit.
 # The .cuh files are sadcs's GPU BWT construction (BWT path only), all in gpubwarp.cu's translation unit.
 if(CMAKE_CUDA_COMPILER)
     add_library(bwarp_cuda STATIC src/cuda/gpubwarp.h src/cuda/gpubwarp.cu src/cuda/differencecover.h
@@ -83,7 +85,7 @@ if(CMAKE_CUDA_COMPILER)
     set_target_properties(bwarp_cuda PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "120-real;120-virtual"
+        CUDA_ARCHITECTURES "${BWARP_CUDA_ARCHITECTURES}"
     )
     target_include_directories(bwarp_cuda PRIVATE src/common src/codec)
     if(MSVC)
@@ -117,6 +119,8 @@ if(MSVC)
     )
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -fno-exceptions $<$<CONFIG:Release>:-O2>)
+    # 64-bit file offsets for fseeko() and ftello(), also on 32-bit systems.
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _FILE_OFFSET_BITS=64)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

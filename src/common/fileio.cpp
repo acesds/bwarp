@@ -65,12 +65,32 @@ namespace {
         return CloseHandle(file) && done == size ? Direct::Done : Direct::Failed;
     }
 #endif
+    // 64-bit seek and tell: the CRT's own on Windows, where long is 32 bits; fseeko() and ftello() elsewhere.
+    int seek64(FILE* fp, int64_t offset, int origin) {
+#if defined(_WIN32)
+        return _fseeki64(fp, offset, origin);
+#else
+        return fseeko(fp, static_cast<off_t>(offset), origin);
+#endif
+    }
+
+    int64_t tell64(FILE* fp) {
+#if defined(_WIN32)
+        return _ftelli64(fp);
+#else
+        return static_cast<int64_t>(ftello(fp));
+#endif
+    }
+
     // File size in bytes, or -1; leaves fp at the start.
     int64_t fileSize(FILE* fp) {
-        _fseeki64(fp, 0, SEEK_END);
-        const int64_t size = _ftelli64(fp);
-        _fseeki64(fp, 0, SEEK_SET);
-        return size;
+        if (seek64(fp, 0, SEEK_END) != 0) {
+            return -1;
+        }
+
+        const int64_t size = tell64(fp);
+
+        return seek64(fp, 0, SEEK_SET) == 0 ? size : -1;
     }
 }
 
@@ -150,7 +170,7 @@ bool readFileInto(const char* path, void* buffer, size_t size, uint64_t offset) 
         return false;
     }
 
-    if (offset != 0 && _fseeki64(fp, static_cast<int64_t>(offset), SEEK_SET) != 0) {
+    if (offset != 0 && seek64(fp, static_cast<int64_t>(offset), SEEK_SET) != 0) {
         fclose(fp);
         return false;
     }
