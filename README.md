@@ -9,7 +9,7 @@ How does it work? I took the GPU suffix sorting from my other project, [sadcs](h
 
 Then the BWT gets entropy coded, still on the GPU. Decompression runs it all backwards: it decodes the streams, then undoes the BWT along many independent chains, starting from rows the compressor wrote down.
 
-So how fast is it? Here are enwik8 (100 MB) and enwik9 (1 GB), compressed with `--segment 16 --slice 16`:
+So how fast is it? The whole thing started as an experiment: could a BWT-based codec decompress enwik9 (1 GB) in under a second? (Sure, some LZ codecs are faster, but where's the fun in that?) Turns out it can, in 0.91 s. Here are enwik8 (100 MB) and enwik9, compressed with `--segment 16 --slice 16`:
 
 | | enwik8 | enwik9 |
 |---|---|---|
