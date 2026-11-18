@@ -1,0 +1,65 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "clang",
+            "displayName": "Visual Studio 17 2022 (ClangCL, standalone LLVM)",
+            "description": "Default toolchain: clang-cl/lld-link from the standalone LLVM package at C:/Program Files/LLVM. CPU parts only.",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
+            "toolset": { "value": "ClangCL", "strategy": "set" },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_VS_GLOBALS": "LLVMInstallDir=C:/Program Files/LLVM;LLVMToolsVersion=22"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "msvc",
+            "displayName": "Visual Studio 17 2022 (MSVC, fallback)",
+            "description": "cl.exe/link.exe; also builds the GPU variant through the CUDA Visual Studio integration if the toolkit is installed.",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
+            "binaryDir": "${sourceDir}/build-msvc",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "cuda",
+            "displayName": "Ninja (clang-cl + nvcc), CPU and GPU parts",
+            "description": "clang-cl for the C++ sources, nvcc with cl.exe as host compiler for the CUDA sources. Needs the MSVC environment (build.bat sets it up) and CUDA 13 or newer.",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-cuda",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CXX_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+                "CMAKE_CUDA_COMPILER": "$env{CUDA_PATH}/bin/nvcc.exe",
+                "CMAKE_CUDA_HOST_COMPILER": "cl.exe"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "linux",
+            "displayName": "Ninja (GCC or Clang), CPU parts only",
+            "description": "The system's C++ compiler (CXX picks another); no GPU variant.",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BWARP_CUDA": "OFF"
+            },
+            "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "linux-cuda",
+            "displayName": "Ninja (GCC + nvcc), CPU and GPU parts",
+            "description": "The system's C++ compiler, and nvcc from the PATH or CUDACXX (CUDA 13 or newer) with GCC as host compiler.",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-cuda",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        }
+    ]
+}

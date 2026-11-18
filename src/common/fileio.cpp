@@ -1,0 +1,248 @@
+/*
+ * fileio.cpp - File read and write helpers for the CLI.
+ *
+ * Part of bwarp, a GPU-based BWT file compressor.
+ * Copyright (c) 2026 Alex Schumacher
+ * Licensed under the MIT License; see the LICENSE file for details.
+ * https://opensource.org/licenses/MIT
+ */
+
+#include "fileio.h"
+#include <algorithm>
+#include <cstdio>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+namespace {
+#if defined(_WIN32)
+    // Uncached writes need the data, its size and the file offset aligned to the sector size; 4 KiB is a multiple
+    // of any disk's.
+    constexpr size_t kDirectAlignment = 4096;
+
+    // Smaller writes are faster through the cache, larger ones past it.
+    constexpr size_t kDirectMinimum = size_t(32) << 20;
+
+    enum class Direct {
+        Done,
+        Unavailable,  // the file can't be opened uncached (as on some network shares), or its size isn't aligned
+        Failed,       // writing or closing failed
+    };
+
+    // Writes size bytes of data past the file cache, to a new file at path or appended to it.
+    Direct writeUncached(const char* path, const uint8_t* data, size_t size, bool append) {
+        const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, append ? OPEN_EXISTING : CREATE_ALWAYS,
+            FILE_FLAG_NO_BUFFERING, nullptr);
+
+        if (file == INVALID_HANDLE_VALUE) {
+            return Direct::Unavailable;
+        }
+
+        if (append) {
+            LARGE_INTEGER end{};
+
+            if (!GetFileSizeEx(file, &end) || end.QuadPart % kDirectAlignment != 0 ||
+                !SetFilePointerEx(file, end, nullptr, FILE_BEGIN)) {
+                CloseHandle(file);
+                return Direct::Unavailable;
+            }
+        }
+
+        // Write in pieces of at most 64 MiB, a multiple of the alignment that WriteFile's DWORD takes.
+        constexpr size_t kPiece = size_t(64) << 20;
+        size_t done = 0;
+
+        while (done < size) {
+            DWORD written = 0;
+
+            if (!WriteFile(file, data + done, static_cast<DWORD>(std::min(kPiece, size - done)), &written, nullptr) ||
+                written == 0) {
+                break;
+            }
+
+            done += written;
+        }
+
+        return CloseHandle(file) && done == size ? Direct::Done : Direct::Failed;
+    }
+#endif
+    // 64-bit seek and tell: the CRT's own on Windows, where long is 32 bits; fseeko() and ftello() elsewhere.
+    int seek64(FILE* fp, int64_t offset, int origin) {
+#if defined(_WIN32)
+        return _fseeki64(fp, offset, origin);
+#else
+        return fseeko(fp, static_cast<off_t>(offset), origin);
+#endif
+    }
+
+    int64_t tell64(FILE* fp) {
+#if defined(_WIN32)
+        return _ftelli64(fp);
+#else
+        return static_cast<int64_t>(ftello(fp));
+#endif
+    }
+
+    // File size in bytes, or -1; leaves fp at the start.
+    int64_t fileSize(FILE* fp) {
+        if (seek64(fp, 0, SEEK_END) != 0) {
+            return -1;
+        }
+
+        const int64_t size = tell64(fp);
+
+        return seek64(fp, 0, SEEK_SET) == 0 ? size : -1;
+    }
+}
+
+bool readWholeFile(const char* path, std::vector<uint8_t>& out, size_t padding) {
+    FILE* fp = fopen(path, "rb");
+
+    if (!fp) {
+        return false;
+    }
+
+    const int64_t size = fileSize(fp);
+
+    if (size < 0) {
+        fclose(fp);
+        return false;
+    }
+
+    out.assign(static_cast<size_t>(size) + padding, 0);
+    const size_t bytesRead = fread(out.data(), 1, static_cast<size_t>(size), fp);
+    fclose(fp);
+
+    return bytesRead == static_cast<size_t>(size);
+}
+
+bool writeWholeFile(const char* path, const void* data, size_t size, bool append) {
+    FILE* fp = fopen(path, append ? "ab" : "wb");
+
+    if (!fp) {
+        return false;
+    }
+
+    const size_t bytesWritten = fwrite(data, 1, size, fp);
+    const bool closed = fclose(fp) == 0;
+
+    return bytesWritten == size && closed;
+}
+
+bool writeFileDirect(const char* path, const void* data, size_t size, bool append) {
+#if defined(_WIN32)
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    const size_t head = size / kDirectAlignment * kDirectAlignment;
+
+    if (size >= kDirectMinimum && reinterpret_cast<uintptr_t>(bytes) % kDirectAlignment == 0) {
+        switch (writeUncached(path, bytes, head, append)) {
+            case Direct::Done: {
+                // The tail, less than a sector, through the cache.
+                if (head == size) {
+                    return true;
+                }
+
+                FILE* fp = fopen(path, "ab");
+
+                if (!fp) {
+                    return false;
+                }
+
+                const size_t bytesWritten = fwrite(bytes + head, 1, size - head, fp);
+                const bool closed = fclose(fp) == 0;
+
+                return bytesWritten == size - head && closed;
+            }
+            case Direct::Failed:
+                return false;
+            case Direct::Unavailable:
+                break;
+        }
+    }
+#endif
+
+    return writeWholeFile(path, data, size, append);
+}
+
+bool readFileInto(const char* path, void* buffer, size_t size, uint64_t offset) {
+    FILE* fp = fopen(path, "rb");
+
+    if (!fp) {
+        return false;
+    }
+
+    if (offset != 0 && seek64(fp, static_cast<int64_t>(offset), SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+
+    // In pieces of at most 1 GiB, each one call underneath.
+    constexpr size_t kPiece = size_t(1) << 30;
+    size_t done = 0;
+
+    while (done < size) {
+        const size_t got = fread(static_cast<uint8_t*>(buffer) + done, 1, std::min(kPiece, size - done), fp);
+
+        if (got == 0) {
+            break;
+        }
+
+        done += got;
+    }
+
+    fclose(fp);
+
+    return done == size;
+}
+
+bool readBwtFile(const char* path, std::vector<uint8_t>& out, int32_t& primary) {
+    FILE* fp = fopen(path, "rb");
+
+    if (!fp) {
+        return false;
+    }
+
+    const int64_t size = fileSize(fp);
+    int32_t blockSize = -1;
+    primary = 0;
+    bool ok = size >= 4 && fread(&blockSize, sizeof(blockSize), 1, fp) == 1 && blockSize >= 0;
+
+    // A single block: the whole text, or nothing at all for an empty one.
+    if (ok && blockSize == 0) {
+        ok = size == 4;
+        out.clear();
+    } else if (ok) {
+        ok = size == 8 + static_cast<int64_t>(blockSize) && fread(&primary, sizeof(primary), 1, fp) == 1;
+
+        if (ok) {
+            out.resize(static_cast<size_t>(blockSize));
+            ok = fread(out.data(), 1, out.size(), fp) == out.size();
+        }
+    }
+
+    fclose(fp);
+
+    return ok;
+}
+
+bool writeBwtFile(const char* path, const uint8_t* bwt, int32_t n, int32_t primary) {
+    FILE* fp = fopen(path, "wb");
+
+    if (!fp) {
+        return false;
+    }
+
+    bool ok = fwrite(&n, sizeof(n), 1, fp) == 1;
+
+    if (ok && n > 0) {
+        ok = fwrite(&primary, sizeof(primary), 1, fp) == 1 &&
+             fwrite(bwt, 1, static_cast<size_t>(n), fp) == static_cast<size_t>(n);
+    }
+
+    const bool closed = fclose(fp) == 0;
+
+    return ok && closed;
+}

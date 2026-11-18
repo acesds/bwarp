@@ -1,0 +1,133 @@
+/*
+ * gpubwarp_stub.cpp - gpubwarp.h without CUDA: every call is unavailable.
+ *
+ * Part of bwarp, a GPU-based BWT file compressor.
+ * Copyright (c) 2026 Alex Schumacher
+ * Licensed under the MIT License; see the LICENSE file for details.
+ * https://opensource.org/licenses/MIT
+ */
+
+#include "gpubwarp.h"
+
+GpuStatus gpuQueryDevice(GpuDevice&) {
+    return GpuStatus::Unavailable;
+}
+
+const char* gpuLastError() {
+#ifdef _WIN32
+    return "bwarp was built without CUDA (configure with the cuda preset)";
+#else
+    return "bwarp was built without CUDA (configure with the linux-cuda preset)";
+#endif
+}
+
+void* gpuAllocatePinned(size_t) {
+    return nullptr;
+}
+
+void gpuFreePinned(void*) {}
+
+int64_t gpuBwtRequiredBytes(int32_t) {
+    return 0;
+}
+
+GpuStatus gpuCreateBwtContext(int32_t, GpuBwtContext*& context) {
+    context = nullptr;
+    return GpuStatus::Unavailable;
+}
+
+void gpuDestroyBwtContext(GpuBwtContext*) {}
+
+GpuStatus gpuBwt(GpuBwtContext*, const uint8_t* text, int32_t n, uint8_t* bwt, int32_t& primary, GpuBwtStats* stats,
+    uint32_t* samples, int logSample) {
+    return gpuBwt(text, n, bwt, primary, stats, samples, logSample);
+}
+
+GpuStatus gpuBwt(const uint8_t*, int32_t, uint8_t*, int32_t& primary, GpuBwtStats* stats, uint32_t*, int) {
+    primary = -1;
+
+    if (stats) {
+        *stats = GpuBwtStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuDecode(const uint8_t*, size_t, std::vector<uint8_t>&, int32_t& primary, GpuDecodeStats* stats) {
+    primary = -1;
+
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuDecompress(const uint8_t*, size_t, std::vector<uint8_t>&, GpuDecodeStats* stats) {
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuDecompress(const uint8_t*, size_t, uint8_t*, size_t, size_t& n, GpuDecodeStats* stats) {
+    n = 0;
+
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+int64_t gpuDecompressRequiredBytes(const uint8_t*, size_t) {
+    return -1;
+}
+
+GpuStatus gpuCreateDecompressContext(int64_t, GpuDecompressContext*& context) {
+    context = nullptr;
+    return GpuStatus::Unavailable;
+}
+
+void gpuDestroyDecompressContext(GpuDecompressContext*) {}
+
+GpuStatus gpuDecompress(GpuDecompressContext*, const uint8_t*, size_t, uint8_t*, size_t, size_t& n,
+    GpuDecodeStats* stats, uint32_t*) {
+    n = 0;
+
+    if (stats) {
+        *stats = GpuDecodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuEncode(const uint8_t*, int32_t, int32_t, uint32_t, const uint32_t*, int, const EncodeParams&,
+    std::vector<uint8_t>&, EncodeStats* encodeStats, GpuEncodeStats* stats) {
+    if (encodeStats) {
+        *encodeStats = EncodeStats{};
+    }
+
+    if (stats) {
+        *stats = GpuEncodeStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
+
+GpuStatus gpuCompress(GpuBwtContext*, const uint8_t*, int32_t, const EncodeParams&, const uint8_t*& out, size_t& size,
+    EncodeStats* encodeStats, GpuCompressStats* stats) {
+    out = nullptr;
+    size = 0;
+
+    if (encodeStats) {
+        *encodeStats = EncodeStats{};
+    }
+
+    if (stats) {
+        *stats = GpuCompressStats{};
+    }
+
+    return GpuStatus::Unavailable;
+}
