@@ -12,7 +12,9 @@ longer exists. Rerun `tools\ltcb.ps1` before submitting (see the checklist below
 
 Measured with `bwarp compress --segment 16 --slice 16` and `bwarp decompress`. Each time is the wall
 clock of the whole process, CUDA start-up and teardown included, and is the best of 3 runs. Both
-round trips were checked byte for byte.
+round trips were checked byte for byte. The times include writing the output to the drive, past the
+file cache, but the input is read warm: after the first run it comes from the Windows file cache,
+not the SSD.
 
 | | enwik8 | enwik9 |
 |---|---|---|
