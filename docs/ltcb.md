@@ -71,7 +71,7 @@ Decompresser    104,799 (zipped source)
 Total           182,044,059
 Comp ns/byte    1.6
 Decomp ns/byte  0.9
-Mem (MB)        10,700 GPU + 1,300 host
+Mem (MB)        11,500 GPU + 1,400 host
 Alg             BWT
 Note            GPU (RTX 5070 Ti); BWT and entropy coding both on the GPU
 Machine         Ryzen 7 5800X, 64 GB DDR4-3600, RTX 5070 Ti 16 GB, Windows 11 Pro
