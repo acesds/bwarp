@@ -5,12 +5,10 @@ programs by the compressed size of enwik9 plus the size of the zipped decompress
 enwik8, compression and decompression times in ns/byte, and memory. This page records bwarp's
 figures, how they were measured, and a draft entry. `tools\ltcb.ps1` reproduces them.
 
-## Results (2026-11-17)
+## Results (2026-11-18)
 
-Measured before the history was condensed into the first public commit, so the measured commit no
-longer exists. Rerun `tools\ltcb.ps1` before submitting (see the checklist below).
-
-Measured with `bwarp compress --segment 16 --slice 16` and `bwarp decompress`. Each time is the wall
+Measured on v0.1.0, with `bwarp.exe` built by `build.bat` from the source zip below, as
+`bwarp compress --segment 16 --slice 16` and `bwarp decompress`. Each time is the wall
 clock of the whole process, CUDA start-up and teardown included, and is the best of 3 runs. Both
 round trips were checked byte for byte. The times include writing the output to the drive, past the
 file cache, but the input is read warm: after the first run it comes from the Windows file cache,
@@ -19,13 +17,13 @@ not the SSD.
 | | enwik8 | enwik9 |
 |---|---|---|
 | Compressed bytes | 23,511,124 | 181,939,260 |
-| Compression, ns/byte | 2.57 | 1.63 |
-| Decompression, ns/byte | 2.20 | 0.91 |
+| Compression, ns/byte | 2.58 | 1.60 |
+| Decompression, ns/byte | 2.04 | 0.93 |
 
 | | Bytes |
 |---|---|
-| Decompresser: the zipped source (`git archive --format=zip -9`; `src`, CMake files, `build.bat`, `LICENSE`) | 104,491 |
-| **enwik9 + decompresser** | **182,043,751** |
+| Decompresser: the zipped source (`git archive --format=zip -9`; `src`, CMake files, `build.bat`, `LICENSE`) | 104,799 |
+| **enwik9 + decompresser** | **182,044,059** |
 
 Peak memory on enwik9, from polling the running processes:
 
@@ -65,17 +63,18 @@ so a 16 GB card compresses enwik9 in one block.
 ## Draft entry
 
 ```
-Program         bwarp (GPU)
+Program         bwarp 0.1.0 (GPU)
 Options         compress --segment 16 --slice 16
 enwik8          23,511,124
 enwik9          181,939,260
-Decompresser    104,491 (zipped source)
-Total           182,043,751
+Decompresser    104,799 (zipped source)
+Total           182,044,059
 Comp ns/byte    1.6
 Decomp ns/byte  0.9
 Mem (MB)        10,700 GPU + 1,300 host
 Alg             BWT
 Note            GPU (RTX 5070 Ti); BWT and entropy coding both on the GPU
+Machine         Ryzen 7 5800X, 64 GB DDR4-3600, RTX 5070 Ti 16 GB, Windows 11 Pro
 ```
 
 Before submitting:

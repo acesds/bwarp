@@ -9,14 +9,14 @@ How does it work? I took the GPU suffix sorting from my other project, [sadcs](h
 
 Then the BWT gets entropy coded, still on the GPU. Decompression runs it all backwards: it decodes the streams, then undoes the BWT along many independent chains, starting from rows the compressor wrote down.
 
-With this design, bwarp decompresses enwik9 (1 GB) in under a second on my test machine: 0.91 s. Here are enwik8 (100 MB) and enwik9, compressed with `--segment 16 --slice 16`:
+With this design, bwarp decompresses enwik9 (1 GB) in under a second on my test machine: 0.93 s. Here are enwik8 (100 MB) and enwik9, compressed with `--segment 16 --slice 16`:
 
 | | enwik8 | enwik9 |
 |---|---|---|
 | Compressed | 23,511,124 bytes | 181,939,260 bytes |
 | Ratio | 4.25:1 (1.88 bits/byte) | 5.50:1 (1.46 bits/byte) |
-| Compress | 0.26 s (2.57 ns/byte) | 1.63 s (1.63 ns/byte) |
-| Decompress | 0.22 s (2.20 ns/byte) | 0.91 s (0.91 ns/byte) |
+| Compress | 0.26 s (2.58 ns/byte) | 1.60 s (1.60 ns/byte) |
+| Decompress | 0.20 s (2.04 ns/byte) | 0.93 s (0.93 ns/byte) |
 
 That's the wall clock for the whole process, CUDA start-up included. CUDA start-up and teardown take a bigger share of a smaller file, which is why enwik8 is slower per byte. I've only measured it on my own machine, an RTX 5070 Ti with a Ryzen 7 5800X and an NVMe SSD under Windows 11, so your times will differ ([docs/ltcb.md](docs/ltcb.md) has more).
 
