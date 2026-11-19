@@ -69,3 +69,8 @@ Testing/
 
 # tools/tune.sh output
 tune-results/
+
+# enwik8 and enwik9 for tools/tune.sh
+/enwik8
+/enwik9
+/enwik*.zip
