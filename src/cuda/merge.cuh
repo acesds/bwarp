@@ -620,6 +620,22 @@ namespace gpusa {
         int levels = 1;                   // levels of splitter merging below the top one
     };
 
+    // The defaults above, or the overrides of a BWARP_TUNING build (tuning.h).
+    inline MergeParams tunedMergeParams() {
+        const Tuning& t = tuning();
+        MergeParams p;
+
+        p.g = t.mergeG;
+        p.tileTarget = t.mergeTile;
+        p.capacity = t.mergeCapacity;
+        p.threads = t.mergeThreads;
+        p.overflowCapacity = t.mergeOverflowCapacity;
+        p.overflowThreads = t.mergeOverflowThreads;
+        p.levels = t.mergeLevels;
+
+        return p;
+    }
+
     // One level of the merge. A child level merges the splitters; the lowest level sorts them with CUB.
     class Merger {
      public:
@@ -727,13 +743,13 @@ namespace gpusa {
                 MergeInput childInput = in;
 
                 childInput.lists = m_childLists;
-                gatherSplitterPositions<<<blocksFor(m_count), kThreads>>>(in, m_splitters, p.g, m_count, m_childLists);
+                gatherSplitterPositions<<<blocksFor(m_count), threadsPerBlock()>>>(in, m_splitters, p.g, m_count, m_childLists);
                 GPUSA_TRY(m_child->run(childInput, m_childSorted, MergeOutput::Indices));
-                childToParent<<<blocksFor(m_count), kThreads>>>(m_layout, m_splitters, p.g, m_childSorted, m_count, m_sorted);
+                childToParent<<<blocksFor(m_count), threadsPerBlock()>>>(m_layout, m_splitters, p.g, m_childSorted, m_count, m_sorted);
             } else {
                 size_t bytes = m_tempBytes;
 
-                pickSplitters<<<blocksFor(m_count), kThreads>>>(m_layout, m_splitters, p.g, m_count, m_sorted);
+                pickSplitters<<<blocksFor(m_count), threadsPerBlock()>>>(m_layout, m_splitters, p.g, m_count, m_sorted);
                 GPUSA_TRY(cub::DeviceMergeSort::SortKeys(m_temp, bytes, m_sorted, m_count, SplitterLess{in}));
             }
 
@@ -745,7 +761,7 @@ namespace gpusa {
                     cuda::strided_iterator(m_positions + l, kPositionStride), m_count));
             }
 
-            searchLists<<<blocksFor(m_count), kThreads>>>(in, m_sorted, m_positions, m_count, p.g);
+            searchLists<<<blocksFor(m_count), threadsPerBlock()>>>(in, m_sorted, m_positions, m_count, p.g);
 
             // The end sentinel: every list complete.
             uint32_t sentinel[kPositionStride] = {};
@@ -758,11 +774,11 @@ namespace gpusa {
             GPUSA_TRY(cudaMemcpy(m_positions + static_cast<size_t>(m_count) * kPositionStride, sentinel, sizeof sentinel,
                 cudaMemcpyHostToDevice));
 
-            sumPositions<<<blocksFor(m_count), kThreads>>>(m_positions, m_count);
+            sumPositions<<<blocksFor(m_count), threadsPerBlock()>>>(m_positions, m_count);
             cutTiles<<<blocksFor(
-                static_cast<uint64_t>(m_tiles) + 1), kThreads>>>(m_positions, m_count, m_tileStart, m_tiles, p.tileTarget);
+                static_cast<uint64_t>(m_tiles) + 1), threadsPerBlock()>>>(m_positions, m_count, m_tileStart, m_tiles, p.tileTarget);
             gatherTileRows<<<blocksFor(
-                static_cast<uint64_t>(m_tiles) + 1), kThreads>>>(m_positions, m_tileStart, m_tiles, m_rows);
+                static_cast<uint64_t>(m_tiles) + 1), threadsPerBlock()>>>(m_positions, m_tileStart, m_tiles, m_rows);
             GPUSA_TRY(cudaMemsetAsync(m_overflowCount, 0, sizeof(uint32_t)));
 
             // From here on, out overwrites the scratch.

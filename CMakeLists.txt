@@ -15,6 +15,7 @@ if(MSVC)
 endif()
 
 option(BWARP_CUDA "Build the GPU variant if a CUDA compiler is found" ON)
+option(BWARP_TUNING "Let BWARP_TUNE_* environment variables override GPU launch parameters (src/cuda/tuning.h)" OFF)
 set(BWARP_CUDA_ARCHITECTURES "86-real;120-real;120-virtual" CACHE STRING
     "GPU architectures for the GPU variant: sm_86 (Ampere), sm_120 (Blackwell) and PTX for newer GPUs by default")
 
@@ -85,13 +86,16 @@ source_group(TREE "${CMAKE_SOURCE_DIR}/src" FILES ${BWARP_SOURCES})
 if(CMAKE_CUDA_COMPILER)
     add_library(bwarp_cuda STATIC src/cuda/gpubwarp.h src/cuda/gpubwarp.cu src/cuda/differencecover.h
         src/cuda/devicecommon.cuh src/cuda/samplerank.cuh src/cuda/classsort.cuh src/cuda/merge.cuh
-        src/cuda/decode.cuh)
+        src/cuda/decode.cuh src/cuda/tuning.h)
     set_target_properties(bwarp_cuda PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "${BWARP_CUDA_ARCHITECTURES}"
     )
     target_include_directories(bwarp_cuda PRIVATE src/common src/codec)
+    if(BWARP_TUNING)
+        target_compile_definitions(bwarp_cuda PRIVATE BWARP_TUNING)
+    endif()
     if(MSVC)
         # CCCL 3 refuses cl.exe's traditional preprocessor.
         target_compile_options(bwarp_cuda PRIVATE -Xcompiler=/Zc:preprocessor,/utf-8)

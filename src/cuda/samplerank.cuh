@@ -296,7 +296,7 @@ namespace gpusa {
             uint32_t u = m;
             PassInput in{m_construction.text, m_construction.ranks, m_construction.n, 0, false};
 
-            initSamplePositions<<<blocksFor(m), kThreads>>>(m_positions[0], m);
+            initSamplePositions<<<blocksFor(m), threadsPerBlock()>>>(m_positions[0], m);
 
             for (int pass = 0; pass < kCharacterPasses && u > 0; pass++) {
                 in.offset = pass == 0 ? 0 : kWideChars + (pass - 1) * kKeyChars;
@@ -388,16 +388,16 @@ namespace gpusa {
                     reinterpret_cast<uint32_t*>(m_keys[0]), reinterpret_cast<uint32_t*>(m_keys[1]));
                 cub::DoubleBuffer<uint32_t> bySubkey(m_positions[current], m_positions[current ^ 1]);
 
-                makeSubkeys<<<blocksFor(u), kThreads>>>(in, m_positions[current], narrow.Current(), u);
+                makeSubkeys<<<blocksFor(u), threadsPerBlock()>>>(in, m_positions[current], narrow.Current(), u);
                 GPUSA_TRY(cub::DeviceRadixSort::SortPairs(m_temp, bytes, narrow, bySubkey, u, 0, subkeyBits));
                 current = bySubkey.selector ? current ^ 1 : current;
             }
 
             for (int k = wide ? 1 : 0; k >= 0 && !in.doubling; k--) {
                 if (wide) {
-                    makeWideKeys<<<blocksFor(u), kThreads>>>(in, k == 1, m_positions[current], subkeys.Current(), u);
+                    makeWideKeys<<<blocksFor(u), threadsPerBlock()>>>(in, k == 1, m_positions[current], subkeys.Current(), u);
                 } else {
-                    makeSubkeys<<<blocksFor(u), kThreads>>>(in, m_positions[current], subkeys.Current(), u);
+                    makeSubkeys<<<blocksFor(u), threadsPerBlock()>>>(in, m_positions[current], subkeys.Current(), u);
                 }
 
                 cub::DoubleBuffer<uint32_t> bySubkey(m_positions[current], m_positions[current ^ 1]);
@@ -425,12 +425,12 @@ namespace gpusa {
 
                 heads = alternate;
                 spare = alternate;
-                markWideGroups<<<blocksFor(u), kThreads>>>(in, subkeys.Current(), m_positions[current], heads, u);
+                markWideGroups<<<blocksFor(u), threadsPerBlock()>>>(in, subkeys.Current(), m_positions[current], heads, u);
                 groupsOut = alternate;  // the head marks, free after the scan
                 ids = alternate + m;
                 unresolved = reinterpret_cast<uint8_t*>(subkeys.Current());
             } else {
-                gatherGroups<<<blocksFor(u), kThreads>>>(in.ranks, m_positions[current], groupBuffers[0], u);
+                gatherGroups<<<blocksFor(u), threadsPerBlock()>>>(in.ranks, m_positions[current], groupBuffers[0], u);
                 cub::DoubleBuffer<uint32_t> groups(groupBuffers[0], groupBuffers[1]);
                 cub::DoubleBuffer<uint32_t> byGroup(m_positions[current], m_positions[current ^ 1]);
 
@@ -438,10 +438,10 @@ namespace gpusa {
                 GPUSA_TRY(cub::DeviceRadixSort::SortPairs(m_temp, bytes, groups, byGroup, u, 0, groupBits));
                 current = byGroup.selector ? current ^ 1 : current;
 
-                markGroupStarts<<<blocksFor(u), kThreads>>>(groups.Current(), scratch[0], u);
+                markGroupStarts<<<blocksFor(u), threadsPerBlock()>>>(groups.Current(), scratch[0], u);
                 bytes = m_tempBytes;
                 GPUSA_TRY(cub::DeviceScan::InclusiveScan(m_temp, bytes, scratch[0], scratch[1], cuda::maximum<>{}, u));
-                markNewGroups<<<blocksFor(u), kThreads>>>(in, static_cast<const uint64_t*>(nullptr),
+                markNewGroups<<<blocksFor(u), threadsPerBlock()>>>(in, static_cast<const uint64_t*>(nullptr),
                     m_positions[current], groups.Current(), scratch[1], heads, u);
                 ids = groups.Alternate();
                 groupsOut = scratch[1];  // the group starts, free after markNewGroups
@@ -472,19 +472,19 @@ namespace gpusa {
             uint32_t* const z = free[1];
             size_t bytes = m_tempBytes;
 
-            makeSubkeys<<<blocksFor(u), kThreads>>>(in, m_positions[current], x, u);
+            makeSubkeys<<<blocksFor(u), threadsPerBlock()>>>(in, m_positions[current], x, u);
             GPUSA_TRY(cub::DeviceSegmentedSort::StableSortPairs(m_temp, bytes, x, z, m_positions[current],
                 m_positions[current ^ 1], static_cast<int64_t>(u), static_cast<int64_t>(m_segments), y, y + 1));
             current ^= 1;
 
-            markGroupStarts<<<blocksFor(u), kThreads>>>(groups, x, u);
+            markGroupStarts<<<blocksFor(u), threadsPerBlock()>>>(groups, x, u);
             bytes = m_tempBytes;
             GPUSA_TRY(cub::DeviceScan::InclusiveScan(m_temp, bytes, x, y, cuda::maximum<>{}, u));
-            markNewGroups<<<blocksFor(u), kThreads>>>(in, z, m_positions[current], groups, y, x, u);
+            markNewGroups<<<blocksFor(u), threadsPerBlock()>>>(in, z, m_positions[current], groups, y, x, u);
             bytes = m_tempBytes;
             GPUSA_TRY(cub::DeviceScan::InclusiveScan(m_temp, bytes, x, y, cuda::maximum<>{}, u));
 
-            const bool partitioned = u >= kPartitionThreshold;
+            const bool partitioned = u >= partitionThreshold();
 
             return storeAndCompact(current, u, y, reinterpret_cast<uint8_t*>(partitioned ? z : x), x,
                 partitioned ? nullptr : z);
@@ -497,8 +497,8 @@ namespace gpusa {
             m_groups = nullptr;
             groupsOut = u >= kGroupedMin ? groupsOut : nullptr;
 
-            if (u < kPartitionThreshold) {
-                storeGroups<<<blocksFor(u), kThreads>>>(m_construction.ranks, m_positions[current], ids, unresolved, u);
+            if (u < partitionThreshold()) {
+                storeGroups<<<blocksFor(u), threadsPerBlock()>>>(m_construction.ranks, m_positions[current], ids, unresolved, u);
 
                 if (groupsOut) {
                     GPUSA_TRY(cub::DeviceSelect::Flagged(m_temp, bytes, ids, unresolved, groupsOut, m_selectedCount, u));
@@ -511,12 +511,12 @@ namespace gpusa {
                 cub::DoubleBuffer<uint32_t> flagged(spare, ids);
 
                 groupsOut = nullptr;
-                flagIds<<<blocksFor(u), kThreads>>>(ids, spare, u);
+                flagIds<<<blocksFor(u), threadsPerBlock()>>>(ids, spare, u);
                 bytes = m_tempBytes;
                 GPUSA_TRY(cub::DeviceRadixSort::SortPairs(
-                    m_temp, bytes, byPosition, flagged, u, std::max(0, high - kPartitionBits), high));
+                    m_temp, bytes, byPosition, flagged, u, std::max(0, high - partitionBits()), high));
                 current = byPosition.selector ? current ^ 1 : current;
-                storeFlaggedGroups<<<blocksFor(u), kThreads>>>(
+                storeFlaggedGroups<<<blocksFor(u), threadsPerBlock()>>>(
                     m_construction.ranks, m_positions[current], flagged.Current(), unresolved, u);
             }
 
@@ -528,11 +528,11 @@ namespace gpusa {
             if (groupsOut) {
                 uint32_t* const offsets = reinterpret_cast<uint32_t*>(unresolved);
 
-                markSegmentHeads<<<blocksFor(u), kThreads>>>(groupsOut, ids, m_selectedCount, u);
+                markSegmentHeads<<<blocksFor(u), threadsPerBlock()>>>(groupsOut, ids, m_selectedCount, u);
                 GPUSA_TRY(cudaMemsetAsync(m_selectedCount + 1, 0, sizeof(int)));
                 bytes = m_tempBytes;
                 GPUSA_TRY(cub::DeviceSelect::If(m_temp, bytes, ids, offsets, m_selectedCount + 2, u, IsSegmentHead{}));
-                finishSegments<<<blocksFor(u / 2 + 1), kThreads>>>(
+                finishSegments<<<blocksFor(u / 2 + 1), threadsPerBlock()>>>(
                     offsets, m_selectedCount + 2, m_selectedCount, m_selectedCount + 1);
             }
 

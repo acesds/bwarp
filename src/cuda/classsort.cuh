@@ -44,7 +44,7 @@ namespace gpusa {
         }
     }
 
-    // A large sample is partitioned by rank before scattering (see kPartitionThreshold).
+    // A large sample is partitioned by rank before scattering (see partitionThreshold()).
     __global__ void samplePairs(const uint32_t* __restrict__ ranks, uint32_t m, uint32_t* __restrict__ keys, uint32_t* __restrict__ positions) {
         const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -164,7 +164,7 @@ namespace gpusa {
 
      private:
         static cudaError_t sortAll(Construction& c, const ClassLists& layout, uint32_t* lists, uint32_t* scratch, uint8_t* temp, size_t tempBytes) {
-            if (c.m >= kPartitionThreshold) {
+            if (c.m >= partitionThreshold()) {
                 uint32_t* const keys0 = scratch;
                 uint32_t* const keys1 = keys0 + c.m;
                 uint32_t* const values0 = keys1 + c.m;
@@ -173,12 +173,12 @@ namespace gpusa {
                 const int high = static_cast<int>(std::bit_width(c.m - 1));
                 size_t bytes = tempBytes;
 
-                samplePairs<<<blocksFor(c.m), kThreads>>>(c.ranks, c.m, keys0, values0);
+                samplePairs<<<blocksFor(c.m), threadsPerBlock()>>>(c.ranks, c.m, keys0, values0);
                 GPUSA_TRY(cub::DeviceRadixSort::SortPairs(
-                    temp, bytes, keys, values, c.m, std::max(0, high - kPartitionBits), high));
-                scatterPairs<<<blocksFor(c.m), kThreads>>>(keys.Current(), values.Current(), c.m, lists + layout.start[0]);
+                    temp, bytes, keys, values, c.m, std::max(0, high - partitionBits()), high));
+                scatterPairs<<<blocksFor(c.m), threadsPerBlock()>>>(keys.Current(), values.Current(), c.m, lists + layout.start[0]);
             } else if (c.m > 0) {
-                scatterSample<<<blocksFor(c.m), kThreads>>>(c.ranks, c.m, lists + layout.start[0]);
+                scatterSample<<<blocksFor(c.m), threadsPerBlock()>>>(c.ranks, c.m, lists + layout.start[0]);
             }
 
             for (int d = 1; d < kClasses; d++) {
@@ -202,9 +202,9 @@ namespace gpusa {
 
                 const bool fromText = d % 4 == 1;
 
-                flagPredecessors<<<blocksFor(count + 1ull), kThreads>>>(previous, count, c.n, d, index);
+                flagPredecessors<<<blocksFor(count + 1ull), threadsPerBlock()>>>(previous, count, c.n, d, index);
                 GPUSA_TRY(cub::DeviceScan::ExclusiveSum(temp, bytes, index, index, count + 1));
-                gatherPredecessors<<<blocksFor(count + 1ull), kThreads>>>(
+                gatherPredecessors<<<blocksFor(count + 1ull), threadsPerBlock()>>>(
                     c.text, previous, fromText ? nullptr : previousKeys, count, c.n, d, index, keys0, positions);
 
                 bytes = tempBytes;

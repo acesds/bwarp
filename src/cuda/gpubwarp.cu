@@ -45,9 +45,7 @@ namespace {
     // which costs about 36 ms/GB to register and 11 ms/GB to unregister.
     class Staging {
      public:
-        static constexpr size_t kChunk = size_t(8) << 20;
-
-        Staging() = default;
+        Staging() : m_chunk(gpusa::tuning().stagingBytes) {}
         Staging(const Staging&) = delete;
         Staging& operator=(const Staging&) = delete;
 
@@ -57,7 +55,7 @@ namespace {
 
         bool create() {
             for (int i = 0; i < 2; i++) {
-                if (cudaMallocHost(&m_buffer[i], kChunk) != cudaSuccess ||
+                if (cudaMallocHost(&m_buffer[i], m_chunk) != cudaSuccess ||
                     cudaEventCreateWithFlags(&m_done[i], cudaEventDisableTiming) != cudaSuccess) {
                     cudaGetLastError();  // clear it
                     release();
@@ -89,8 +87,8 @@ namespace {
                 return cudaMemcpy(device, host, bytes, cudaMemcpyHostToDevice);
             }
 
-            for (size_t k = 0, offset = 0; offset < bytes; k++, offset += kChunk) {
-                const size_t length = std::min(kChunk, bytes - offset);
+            for (size_t k = 0, offset = 0; offset < bytes; k++, offset += m_chunk) {
+                const size_t length = std::min(m_chunk, bytes - offset);
                 const int b = static_cast<int>(k & 1);
 
                 GPUSA_TRY(cudaEventSynchronize(m_done[b]));  // its previous DMA is done
@@ -108,13 +106,13 @@ namespace {
                 return cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost);
             }
 
-            const size_t chunks = (bytes + kChunk - 1) / kChunk;
+            const size_t chunks = (bytes + m_chunk - 1) / m_chunk;
             const auto issue = [&](size_t k) -> cudaError_t {
-                const size_t offset = k * kChunk;
+                const size_t offset = k * m_chunk;
                 const int b = static_cast<int>(k & 1);
 
                 GPUSA_TRY(cudaMemcpyAsync(m_buffer[b], static_cast<const uint8_t*>(device) + offset,
-                    std::min(kChunk, bytes - offset), cudaMemcpyDeviceToHost, 0));
+                    std::min(m_chunk, bytes - offset), cudaMemcpyDeviceToHost, 0));
 
                 return cudaEventRecord(m_done[b], 0);
             };
@@ -130,10 +128,10 @@ namespace {
                 }
 
                 const int b = static_cast<int>(k & 1);
-                const size_t offset = k * kChunk;
+                const size_t offset = k * m_chunk;
 
                 GPUSA_TRY(cudaEventSynchronize(m_done[b]));
-                memcpy(static_cast<uint8_t*>(host) + offset, m_buffer[b], std::min(kChunk, bytes - offset));
+                memcpy(static_cast<uint8_t*>(host) + offset, m_buffer[b], std::min(m_chunk, bytes - offset));
             }
 
             return cudaSuccess;
@@ -141,6 +139,7 @@ namespace {
 
      private:
         uint8_t* m_buffer[2] = {};
+        const size_t m_chunk;  // 8 MiB unless tuned (tuning.h)
         cudaEvent_t m_done[2] = {};
 
         void release() {
@@ -182,7 +181,9 @@ namespace {
 
         const ClassLists layout = classLists(tables, n);
 
-        merger.plan(layout, MergeParams{}, MergeParams{}.levels);
+        const MergeParams mergeParams = tunedMergeParams();
+
+        merger.plan(layout, mergeParams, mergeParams.levels);
         GPUSA_TRY(merger.queryTemp());
 
         plan.outputWords = std::max({static_cast<size_t>(n), ClassSort::scratchWords(layout), merger.scratchWords()});

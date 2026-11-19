@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include "differencecover.h"
 #include "gpubwarp.h"
+#include "tuning.h"
 
 #define GPUSA_TRY(call)                       \
     do {                                      \
@@ -38,7 +39,10 @@ namespace gpusa {
     constexpr int kCoverPeriod = 32;
     constexpr int kCoverSize = GpuCover::kSize;
     constexpr int kClasses = GpuCover::kNextSampleDistanceCount;  // d = 0 (the sample) to 6
-    constexpr int kThreads = 256;
+    // Threads per block of the element-wise kernels (tuning.h).
+    inline unsigned threadsPerBlock() {
+        return tuning().threads;
+    }
 
     static_assert(kCoverPeriod == 32 && kCoverSize == 7 && kClasses == 7, "the tables below assume the cover modulo 32");
 
@@ -119,9 +123,15 @@ namespace gpusa {
         }
     };
 
-    // Above this many random writes, one radix pass on the top bits of the target first, so L2 combines them.
-    constexpr uint32_t kPartitionThreshold = 1u << 22;
-    constexpr int kPartitionBits = 8;
+    // Above this many random writes, one radix pass on the top bits of the target first, so L2 combines them
+    // (2^22 writes and 8 bits by default; tuning.h).
+    inline uint32_t partitionThreshold() {
+        return tuning().partitionThreshold;
+    }
+
+    inline int partitionBits() {
+        return tuning().partitionBits;
+    }
 
     inline size_t textWords(int32_t n) {
         return static_cast<size_t>(n) / 8 + kTextPaddingWords;
@@ -132,7 +142,8 @@ namespace gpusa {
     }
 
     inline unsigned blocksFor(uint64_t count) {
-        return static_cast<unsigned>((count + kThreads - 1) / kThreads);
+        const unsigned threads = threadsPerBlock();
+        return static_cast<unsigned>((count + threads - 1) / threads);
     }
 
     // Index of the first sample position >= p in the rank array.
