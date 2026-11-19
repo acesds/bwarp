@@ -17,6 +17,8 @@ if not errorlevel 1 goto cuda
 set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
 for /f "usebackq delims=" %%i in (`call "%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%i
 if not defined VSDIR echo Visual Studio with the C++ tools not found.& exit /b 1
+rem vcvars64.bat runs vswhere.exe by name, so its folder must be on PATH.
+set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b %errorlevel%
 
