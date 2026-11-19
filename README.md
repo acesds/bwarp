@@ -42,7 +42,7 @@ For a block of n bytes:
 
 ## Requirements
 
-- **An NVIDIA Blackwell GPU (RTX 50 series) or newer.** The binaries contain code for sm_120 only, so earlier GPUs such as the RTX 40 or 30 series can't run them yet.
+- **An NVIDIA Ampere GPU (RTX 30 series) or newer.** The GPU code is built for sm_86 and sm_120, tested on an RTX 3090 and an RTX 5070 Ti; the RTX 40 series runs the sm_86 code but is untested. The v0.1.0 binaries contain sm_120 only, so they need an RTX 50 series GPU.
 - **An NVIDIA driver for CUDA 13**, version 580 or newer. The CUDA runtime is built into bwarp.
 - **Windows:** 64-bit Windows 10 or 11. Nothing else needs installing.
 - **Linux:** x86-64 with glibc 2.34 and the C++ library of GCC 13.2 or newer, for example Ubuntu 24.04, Debian 13 or Fedora 39.
@@ -69,7 +69,7 @@ bwarp compress data packed           # every file in data, into packed
 
 ## Build
 
-bwarp builds on Windows x64 and on Linux (tested under WSL2 with Ubuntu). Without the CUDA toolkit you get the CPU parts only: the reference codec, the checker and the selftest. The GPU variant targets sm_120 (Blackwell) plus PTX for newer GPUs; pass `-DBWARP_CUDA_ARCHITECTURES=...` to build for others, though I've only tested it on sm_120.
+bwarp builds on Windows x64 and on Linux (tested under WSL2 with Ubuntu). Without the CUDA toolkit you get the CPU parts only: the reference codec, the checker and the selftest. The GPU variant targets sm_86 (Ampere) and sm_120 (Blackwell) plus PTX for newer GPUs; pass `-DBWARP_CUDA_ARCHITECTURES=...` to build for others, though I've only tested it on sm_86 and sm_120.
 
 ### Linux
 
