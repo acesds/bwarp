@@ -15,8 +15,8 @@ if(MSVC)
 endif()
 
 option(BWARP_CUDA "Build the GPU variant if a CUDA compiler is found" ON)
-set(BWARP_CUDA_ARCHITECTURES "120-real;120-virtual" CACHE STRING
-    "GPU architectures for the GPU variant: sm_120 (Blackwell) and PTX for newer GPUs by default")
+set(BWARP_CUDA_ARCHITECTURES "86-real;120-real;120-virtual" CACHE STRING
+    "GPU architectures for the GPU variant: sm_86 (Ampere), sm_120 (Blackwell) and PTX for newer GPUs by default")
 
 # The GPU variant is optional: without a CUDA compiler bwarp builds the CPU parts only, and
 # gpubwarp_stub.cpp reports every GPU call as unavailable. With the ClangCL toolset the CUDA 13.5
